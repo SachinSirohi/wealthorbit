@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "wealthorbit-site",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8055", "--directory", "/Users/sachinsirohi/Desktop/wealthorbit-site"],
+      "port": 8055
+    }
+  ]
+}
