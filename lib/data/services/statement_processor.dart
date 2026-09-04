@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
+import '../../core/amount_sanity.dart';
 import '../database/database.dart';
 import '../repositories/app_repository.dart';
 import 'gemini_service.dart';
@@ -24,7 +26,7 @@ String? mapCategoryHint(String? hint) {
 /// Brokers/demat senders whose statements carry HOLDINGS, not transactions.
 bool isBrokerageSender(String text) {
   final s = text.toLowerCase();
-  return RegExp(r'zerodha|groww|upstox|angelone|angel one|5paisa|icicidirect|hdfcsec|kotaksecurities|cdsl|nsdl|kfintech|camsonline|\bdemat\b|reportsmailer')
+  return RegExp(r'zerodha|groww|upstox|angelone|angel one|5paisa|icicidirect|hdfcsec|kotaksecurities|cdsl|nsdl|kfintech|cams(online|nps)?|npscra|protean|\bnps\b|\bdemat\b|reportsmailer')
       .hasMatch(s);
 }
 
@@ -45,27 +47,83 @@ class StatementProcessor {
   final AppRepository repository;
   StatementProcessor(this.repository);
 
-  /// Ensure Gemini is configured and initialized.
+  /// Ensure the statement LLM is configured and initialized.
   /// Returns null on success, or a user-facing error message.
   static Future<String?> ensureGeminiReady() async {
+    await GeminiService.seedDefaultKey();
     if (!await SecureVault.hasGeminiApiKey()) {
-      return 'Add your Gemini API key in Settings to extract statements.';
+      return 'Add your AI API key in Settings to extract statements.';
     }
     final ok = await GeminiService.initialize();
-    return ok ? null : 'Could not initialize Gemini AI. Check your API key and connection.';
+    return ok ? null : 'Could not initialize AI. Check your API key and connection.';
+  }
+
+  /// Open a statement PDF, trying passwords the user has already saved for
+  /// other sources when the one on file does not work.
+  ///
+  /// A household usually protects every statement with the same one or two
+  /// secrets. Without this, unlocking Zerodha did nothing for CDSL, NSDL or
+  /// CAMS — each had to be typed separately, and until it was, every one of
+  /// their statements failed. A password that works is written back to this
+  /// source so the next sync uses it directly.
+  Future<String?> _extractText({
+    required Uint8List bytes,
+    String? password,
+    String? sourceId,
+    String? senderEmail,
+  }) async {
+    try {
+      return await PdfExtractionService.extractText(bytes, password: password);
+    } catch (firstError) {
+      final candidates = (await SecureVault.getKnownPdfPasswords())
+          .where((p) => p != password)
+          .toList();
+      for (final candidate in candidates) {
+        try {
+          final text = await PdfExtractionService.extractText(bytes, password: candidate);
+          debugPrint('🔑 Opened with a password saved for another source');
+          if (sourceId != null || senderEmail != null) {
+            await SecureVault.setPdfPasswordForSource(
+              sourceId: sourceId,
+              senderEmail: senderEmail,
+              password: candidate,
+            );
+          }
+          return text;
+        } catch (_) {
+          // wrong password for this PDF — keep trying
+        }
+      }
+      rethrow; // surface the original "needs a password" error
+    }
   }
 
   /// Extract transactions from [bytes] and persist them against [accountId].
-  /// Imported transactions are marked `pending` for reconciliation. Returns the
-  /// number of transactions inserted.
-  Future<int> processPdf({
+  /// Imported transactions are marked `pending` for reconciliation.
+  ///
+  /// Returns a [StatementImportResult]. A result with `imported == 0` always
+  /// carries an `emptyReason` — callers must surface it instead of recording
+  /// the statement as a silent success.
+  Future<StatementImportResult> processPdf({
     required Uint8List bytes,
     required String accountId,
     String? pdfPassword,
     String? statementId,
+    String? sourceId,
+    String? senderEmail,
   }) async {
-    final text = await PdfExtractionService.extractText(bytes, password: pdfPassword);
-    if (text == null || text.trim().isEmpty) return 0;
+    final text = await _extractText(
+      bytes: bytes,
+      password: pdfPassword,
+      sourceId: sourceId,
+      senderEmail: senderEmail,
+    );
+    if (text == null || text.trim().isEmpty) {
+      return const StatementImportResult(
+        emptyReason: 'The PDF opened but contained no extractable text '
+            '(it is probably a scanned image).',
+      );
+    }
 
     // The account's own currency is the authoritative reporting currency
     // (an HDFC statement is ₹ even if the AI guesses otherwise). amountBase
@@ -76,8 +134,38 @@ class StatementProcessor {
 
     final parsed = await GeminiService.parseStatementText(text);
     final closingBalance = GeminiService.lastClosingBalance;
+    if (parsed.isEmpty) {
+      return const StatementImportResult(
+        emptyReason: 'The AI read the statement but found no transactions in it.',
+      );
+    }
+
+    // CURRENCY GUARD: the destination account decides how every amount is
+    // labelled and converted, so importing an INR statement into an AED
+    // account silently multiplies every figure by the AED rate. When the
+    // statement plainly reports another currency, refuse rather than write
+    // mislabelled rows — the fix is to map the sender to the right account.
+    final reported = _dominantCurrency(parsed);
+    if (reported != null && reported != currency) {
+      return StatementImportResult(
+        emptyReason: 'This statement is in $reported but '
+            '"${account?.name ?? accountId}" is a $currency account. '
+            'Map this sender to the correct account, then retry.',
+      );
+    }
+
     int count = 0;
     int skippedDupes = 0;
+    int skippedAbsurd = 0;
+    // Peer set for the outlier guard: EXPENSES only. A salary credit or a
+    // full card-bill payment legitimately dwarfs every purchase around it,
+    // and comparing it against those peers threw away the real row.
+    final peerAmounts = parsed
+        .where((tx) => (tx['type'] ?? 'expense').toString() == 'expense')
+        .map((tx) => (tx['amount'] as num?)?.toDouble() ?? 0)
+        .where((a) => a > 0)
+        .toList();
+
     for (final tx in parsed) {
       final amount = (tx['amount'] as num?)?.toDouble() ?? 0;
       if (amount <= 0) continue;
@@ -85,11 +173,33 @@ class StatementProcessor {
       final date = DateTime.tryParse((tx['date'] ?? '').toString()) ?? DateTime.now();
       final description = (tx['description'] ?? '').toString();
       final merchant = tx['merchant'] as String?;
+      final txnClass = (tx['txn_class'] ?? '').toString();
+
+      // Large-but-real rows (income, card payments, investment funding) are
+      // exempt from the peer-outlier test; the absolute ceiling still applies.
+      final exemptFromPeers = type == 'income' ||
+          txnClass == 'cc_payment' ||
+          txnClass == 'own_transfer' ||
+          txnClass == 'investment';
+
+      if (!AmountSanity.isPlausible(amount, currency) ||
+          (!exemptFromPeers &&
+              AmountSanity.isOutlierVsPeers(amount, peerAmounts,
+                  currencyCode: currency))) {
+        skippedAbsurd++;
+        debugPrint(
+            '🛑 Skipped absurd amount $amount $currency · ${description.length > 40 ? description.substring(0, 40) : description}');
+        continue;
+      }
 
       // DEDUPE: never import the same transaction twice (re-synced or
       // overlapping statements are skipped silently).
       if (await repository.transactionExists(
-          accountId: accountId, amountSource: amount, date: date, type: type)) {
+          accountId: accountId,
+          amountSource: amount,
+          date: date,
+          type: type,
+          description: description)) {
         skippedDupes++;
         continue;
       }
@@ -101,7 +211,16 @@ class StatementProcessor {
           (type == 'income' ? incomeCategoryFromText('$description ${merchant ?? ''}') : null);
 
       await repository.insertTransaction(TransactionsCompanion.insert(
-        id: '${DateTime.now().millisecondsSinceEpoch}_$count',
+        // Content-derived id: re-importing the same statement line produces
+        // the same id, so imports are idempotent and two PDFs finishing in
+        // the same millisecond can no longer collide on the primary key.
+        id: statementLineId(
+          accountId: accountId,
+          date: date,
+          amount: amount,
+          type: type,
+          description: description,
+        ),
         accountId: accountId,
         amountSource: amount,
         amountBase: amount * rateToBase,
@@ -112,6 +231,7 @@ class StatementProcessor {
         merchant: Value(merchant),
         categoryId: Value(categoryId),
         sourceStatementId: Value(statementId),
+        txnClass: Value(txnClass.isEmpty ? null : txnClass),
         status: const Value('pending'),
       ));
       count++;
@@ -119,13 +239,12 @@ class StatementProcessor {
     if (skippedDupes > 0) {
       debugPrint('🔁 Skipped $skippedDupes duplicate transactions for $accountId');
     }
+    if (skippedAbsurd > 0) {
+      debugPrint('🛑 Skipped $skippedAbsurd absurd-amount lines for $accountId');
+    }
 
-    // Anchor the account to the statement's stated closing balance so the
-    // displayed balance is the bank's real number, not a from-zero sum.
-    // Tag it with the statement's newest transaction date so only the most
-    // recent statement's balance sticks (older statements processed later
-    // must not clobber a newer balance).
-    if (closingBalance != null) {
+    // Only trust a closing balance that itself looks plausible.
+    if (closingBalance != null && AmountSanity.isPlausible(closingBalance.abs(), currency)) {
       DateTime? stmtDate;
       for (final tx in parsed) {
         final d = DateTime.tryParse((tx['date'] ?? '').toString());
@@ -134,51 +253,175 @@ class StatementProcessor {
       await repository.applyClosingBalance(accountId, closingBalance, statementDate: stmtDate);
       debugPrint('🏦 Anchored $accountId to closing balance $closingBalance (stmt ${stmtDate?.toIso8601String().split('T').first ?? 'n/a'})');
     }
-    return count;
+
+    return StatementImportResult(
+      imported: count,
+      duplicates: skippedDupes,
+      rejected: skippedAbsurd,
+      emptyReason: count > 0
+          ? null
+          : skippedDupes > 0
+              ? 'Every transaction in this statement was already imported.'
+              : 'No usable transactions were found in this statement.',
+    );
+  }
+
+  /// The currency the statement itself reports, when it reports one
+  /// consistently. Null when the lines disagree or none is stated.
+  static String? _dominantCurrency(List<Map<String, dynamic>> parsed) {
+    final counts = <String, int>{};
+    for (final tx in parsed) {
+      final c = (tx['currency'] ?? '').toString().trim().toUpperCase();
+      if (c.length != 3) continue;
+      counts[c] = (counts[c] ?? 0) + 1;
+    }
+    if (counts.isEmpty) return null;
+    final total = counts.values.reduce((a, b) => a + b);
+    final top = counts.entries.reduce((a, b) => a.value >= b.value ? a : b);
+    // Only act when the statement is overwhelmingly one currency; a handful
+    // of foreign-currency lines on a card statement is normal.
+    return top.value / total >= 0.8 ? top.key : null;
   }
 
   /// Brokerage path: extract HOLDINGS and upsert them as investment Assets
   /// (Investments tab), instead of treating portfolio lines as transactions.
-  /// Returns the number of holdings upserted.
-  Future<int> processBrokeragePdf({
+  /// Returns how many holdings were upserted, with a reason when none were.
+  Future<StatementImportResult> processBrokeragePdf({
     required Uint8List bytes,
     required String accountId,
     String? pdfPassword,
     String? bankName,
+    String? sourceId,
+    String? senderEmail,
   }) async {
-    final text = await PdfExtractionService.extractText(bytes, password: pdfPassword);
-    if (text == null || text.trim().isEmpty) return 0;
+    final text = await _extractText(
+      bytes: bytes,
+      password: pdfPassword,
+      sourceId: sourceId,
+      senderEmail: senderEmail,
+    );
+    if (text == null || text.trim().isEmpty) {
+      return const StatementImportResult(
+        emptyReason: 'The PDF opened but contained no extractable text '
+            '(it is probably a scanned image).',
+      );
+    }
 
     final account = await repository.getAccount(accountId);
     final currency = account?.currencyCode ?? 'INR';
 
     final holdings = await GeminiService.parseBrokerageStatement(text);
+    final asOf = GeminiService.lastStatementDate;
     int count = 0;
     for (final h in holdings) {
       final symbol = (h['symbol'] ?? h['name'] ?? '').toString().trim();
       final value = (h['value'] as num?)?.toDouble() ?? 0;
       if (symbol.isEmpty || value <= 0) continue;
-      final kind = (h['kind'] ?? 'stock').toString() == 'mutual_fund' ? 'mutual_funds' : 'stocks';
-      final id = 'hold_${accountId}_${symbol.replaceAll(RegExp(r'[^A-Za-z0-9]'), '')}';
-      final existing = await repository.getAsset(id);
+      if (!AmountSanity.isPlausible(value, currency)) continue;
+      final kind = (h['kind'] ?? 'stocks').toString();
+      final isin = (h['isin'] ?? '').toString().trim();
+      final quantity = (h['quantity'] as num?)?.toDouble();
+      final price = (h['price'] as num?)?.toDouble();
+
+      // Existing rows are keyed on the symbol; keep that so re-syncs update
+      // rather than duplicate. New rows prefer the ISIN, which is stable
+      // across brokers and across a symbol rename.
+      final symbolId = 'hold_${accountId}_${symbol.replaceAll(RegExp(r'[^A-Za-z0-9]'), '')}';
+      final isinId = isin.isNotEmpty ? 'hold_${accountId}_$isin' : null;
+      final existing = await repository.getAsset(symbolId) ??
+          (isinId != null ? await repository.getAsset(isinId) : null);
+
+      // Stock detail lives in `metadata` (the Assets table has no columns for
+      // it): units, price/NAV, ISIN, statement date and where it came from.
+      final metadata = json.encode({
+        'isin': isin.isNotEmpty ? isin : null,
+        'quantity': quantity,
+        'price': price,
+        'symbol': symbol,
+        'asOf': asOf,
+        'source': bankName,
+        'accountId': accountId,
+        'updatedAt': DateTime.now().toIso8601String(),
+      });
+
       if (existing == null) {
         await repository.insertAsset(AssetsCompanion.insert(
-          id: id,
+          id: isinId ?? symbolId,
           name: (h['name'] ?? symbol).toString(),
           type: kind,
           currencyCode: currency,
+          // Cost basis is not on a holdings statement; the first sighting
+          // becomes the baseline until a contract note / P&L supplies it.
           purchaseValue: value,
           currentValue: value,
           purchaseDate: DateTime.now(),
           geography: currency == 'INR' ? 'India' : 'UAE',
-          isLiquid: const Value(true),
+          isLiquid: Value(kind != 'nps'),
+          lockInMonths: Value(kind == 'nps' ? 999 : 0),
+          metadata: Value(metadata),
         ));
       } else {
-        await repository.updateAsset(id, AssetsCompanion(currentValue: Value(value)));
+        await repository.updateAsset(
+          existing.id,
+          AssetsCompanion(
+            currentValue: Value(value),
+            type: Value(kind),
+            metadata: Value(metadata),
+          ),
+        );
       }
       count++;
     }
     debugPrint('📈 ${bankName ?? accountId}: upserted $count holdings');
-    return count;
+    return StatementImportResult(
+      imported: count,
+      emptyReason:
+          count > 0 ? null : 'No holdings were found in this portfolio statement.',
+    );
   }
+}
+
+/// Outcome of importing one statement PDF.
+///
+/// `imported == 0` always carries an [emptyReason]. The queue records that
+/// reason instead of marking the statement `completed`, so "processed but
+/// nothing changed" can never look like success again.
+class StatementImportResult {
+  final int imported;
+  final int duplicates;
+  final int rejected;
+  final String? emptyReason;
+
+  const StatementImportResult({
+    this.imported = 0,
+    this.duplicates = 0,
+    this.rejected = 0,
+    this.emptyReason,
+  });
+
+  bool get isEmpty => imported == 0;
+}
+
+/// Stable, content-derived id for one imported statement line.
+///
+/// Ids used to be `<millisecondsSinceEpoch>_<index>`, which made re-imports
+/// produce fresh rows and let two PDFs finishing in the same millisecond
+/// collide on the primary key. Hashing the line's own content fixes both.
+String statementLineId({
+  required String accountId,
+  required DateTime date,
+  required double amount,
+  required String type,
+  required String description,
+}) {
+  final normalized = description.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
+  final seed = '$accountId|${date.toIso8601String().split('T').first}'
+      '|${amount.toStringAsFixed(2)}|$type|$normalized';
+  // FNV-1a 64-bit — stable across runs and isolates, unlike String.hashCode.
+  var hash = 0xcbf29ce484222325;
+  for (final unit in seed.codeUnits) {
+    hash ^= unit;
+    hash = (hash * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+  }
+  return 'tx_${hash.toRadixString(16).padLeft(16, '0')}';
 }

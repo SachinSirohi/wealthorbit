@@ -2,11 +2,13 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'core/theme/wo_design.dart';
 import 'data/services/secure_vault.dart';
 import 'data/services/notification_service.dart';
 import 'data/services/background_service.dart';
+import 'data/services/gemini_service.dart';
 import 'data/repositories/app_repository.dart';
 import 'data/services/fx_service.dart';
 import 'data/services/demo_data_service.dart';
@@ -54,6 +56,24 @@ void main() async {
     if (await SecureVault.hasEmailCredentials()) {
       await BackgroundService.initialize();
       await BackgroundService.registerTasks();
+      await Permission.ignoreBatteryOptimizations.request();
+      // One-shot catch-up: older builds crashed the worker on a 32-bit
+      // notification id, so statements sat unprocessed for months.
+      // v402 re-queues AI timeouts after thinking was disabled.
+      try {
+        final repo = await AppRepository.getInstance();
+        if (!await repo.getBoolSetting('catchup_sync_v402')) {
+          for (final item in await repo.getAllStatementQueue()) {
+            if (item.status == 'failed' || item.status == 'processing') {
+              await repo.updateStatementQueueStatus(item.id, 'pending');
+            }
+          }
+          await BackgroundService.executeNow(BackgroundService.statementProcessingTask);
+          await repo.setAppSetting('catchup_sync_v402', 'true');
+        }
+      } catch (e) {
+        debugPrint('Catch-up sync schedule error: $e');
+      }
     }
   } catch (e) {
     debugPrint('Background service init error: $e');
@@ -85,9 +105,64 @@ void main() async {
 
     // Data maintenance: merge per-sender duplicate accounts & sources, and
     // retype credit-card accounts (idempotent, cheap — run every launch).
-    await repo.mergeDuplicateAccounts();
-    await repo.mergeDuplicateSources();
-    await repo.retypeCardAccounts();
+    // Each step is isolated so one FK failure cannot skip FX seeding.
+    try {
+      await repo.mergeDuplicateAccounts();
+    } catch (e) {
+      debugPrint('mergeDuplicateAccounts skipped: $e');
+    }
+    try {
+      await repo.mergeDuplicateSources();
+    } catch (e) {
+      debugPrint('mergeDuplicateSources skipped: $e');
+    }
+    try {
+      await repo.retypeCardAccounts();
+    } catch (e) {
+      debugPrint('retypeCardAccounts skipped: $e');
+    }
+    try {
+      await repo.retypeBrokerageAccounts();
+    } catch (e) {
+      debugPrint('retypeBrokerageAccounts skipped: $e');
+    }
+
+    // One-shot (v4.1.0): repair the statement pipeline.
+    //  * accounts the old loose card heuristic flipped to credit_card (and
+    //    re-signed as debt) go back to being bank accounts;
+    //  * every statement that failed or imported nothing is re-queued, now
+    //    that PDF passwords resolve across all key spaces and statements are
+    //    windowed instead of clipped.
+    try {
+      if (!await repo.getBoolSetting('pipeline_repair_v410')) {
+        final fixed = await repo.repairMiscardedAccounts();
+        final requeued = await repo.requeueFailedStatements();
+        await repo.setAppSetting('pipeline_repair_v410', 'true');
+        debugPrint('🩹 Pipeline repair: $fixed account(s) retyped, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('pipeline_repair_v410 skipped: $e');
+    }
+
+    // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
+    // and reset affected account closing anchors so balances can recover.
+    try {
+      if (!await repo.getBoolSetting('absurd_tx_quarantine_v1')) {
+        final n = await repo.quarantineAbsurdTransactions();
+        await repo.setAppSetting('absurd_tx_quarantine_v1', 'true');
+        debugPrint('🧹 Absurd-tx quarantine removed $n rows');
+      }
+    } catch (e) {
+      debugPrint('absurd_tx_quarantine skipped: $e');
+    }
+
+    // Built-in Qwen key so extraction works without a Google Gemini key.
+    try {
+      await GeminiService.seedDefaultKey();
+    } catch (e) {
+      debugPrint('AI key seed error: $e');
+    }
 
     // Marketing/demo builds only (flutter build … --dart-define=DEMO=true):
     // seeds a fully fictional dataset for screenshots.

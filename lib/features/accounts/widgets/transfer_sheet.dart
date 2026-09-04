@@ -47,11 +47,33 @@ class TransferSheet extends StatefulWidget {
 
 class _TransferSheetState extends State<TransferSheet> {
   final _amountController = TextEditingController();
+  final _receivedController = TextEditingController();
+  final _feeController = TextEditingController();
   final _noteController = TextEditingController();
   String? _fromId;
   String? _toId;
   DateTime _date = DateTime.now();
   bool _saving = false;
+
+  Account? get _from => widget.accounts.where((a) => a.id == _fromId).firstOrNull;
+  Account? get _to => widget.accounts.where((a) => a.id == _toId).firstOrNull;
+  bool get _crossCurrency =>
+      _from != null && _to != null && _from!.currencyCode != _to!.currencyCode;
+
+  /// Prefill "received" from today's rate; the user overwrites it with the
+  /// figure on the remittance receipt.
+  Future<void> _prefillReceived() async {
+    if (!_crossCurrency) return;
+    final amount = double.tryParse(_amountController.text) ?? 0;
+    if (amount <= 0) return;
+    final base = await widget.repository.toBase(amount, _from!.currencyCode);
+    final toRate =
+        (await widget.repository.getCurrency(_to!.currencyCode))?.rateToBase ?? 1.0;
+    if (!mounted) return;
+    if (_receivedController.text.isEmpty) {
+      _receivedController.text = (base / toRate).toStringAsFixed(2);
+    }
+  }
 
   bool get _isBillPay => widget.creditCard != null;
 
@@ -73,6 +95,8 @@ class _TransferSheetState extends State<TransferSheet> {
   @override
   void dispose() {
     _amountController.dispose();
+    _receivedController.dispose();
+    _feeController.dispose();
     _noteController.dispose();
     super.dispose();
   }
@@ -101,6 +125,8 @@ class _TransferSheetState extends State<TransferSheet> {
           amount: amount,
           date: _date,
           note: _noteController.text,
+          toAmount: _crossCurrency ? double.tryParse(_receivedController.text) : null,
+          feeAmount: double.tryParse(_feeController.text),
         );
       }
       HapticFeedback.mediumImpact();
@@ -125,23 +151,51 @@ class _TransferSheetState extends State<TransferSheet> {
           _accountDropdown(
             label: 'From',
             value: _fromId,
-            onChanged: (v) => setState(() => _fromId = v),
+            onChanged: (v) => setState(() {
+              _fromId = v;
+              _receivedController.clear();
+            }),
           ),
           const SizedBox(height: 14),
           _accountDropdown(
             label: _isBillPay ? 'To (Card)' : 'To',
             value: _toId,
             enabled: !_isBillPay,
-            onChanged: (v) => setState(() => _toId = v),
+            onChanged: (v) => setState(() {
+              _toId = v;
+              _receivedController.clear();
+            }),
           ),
           const SizedBox(height: 14),
           TextField(
             controller: _amountController,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             style: WoText.bodyHi(),
-            decoration: woInput('Amount'),
+            decoration: woInput(_from != null ? 'Amount sent (${_from!.currencyCode})' : 'Amount'),
+            onChanged: (_) => _prefillReceived(),
           ),
           const SizedBox(height: 14),
+          if (_crossCurrency) ...[
+            // Cross-currency: what arrives is a different number. Without it
+            // the destination was credited with the SOURCE amount — an AED
+            // 5,000 remittance landing as ₹5,000.
+            TextField(
+              controller: _receivedController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: WoText.bodyHi(),
+              decoration: woInput('Amount received (${_to!.currencyCode})'),
+            ),
+            const SizedBox(height: 14),
+          ],
+          if (!_isBillPay) ...[
+            TextField(
+              controller: _feeController,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: WoText.bodyHi(),
+              decoration: woInput('Fee (optional, ${_from?.currencyCode ?? ''})'),
+            ),
+            const SizedBox(height: 14),
+          ],
           if (!_isBillPay) ...[
             TextField(
               controller: _noteController,

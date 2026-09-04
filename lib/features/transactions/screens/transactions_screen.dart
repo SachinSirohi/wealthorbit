@@ -125,6 +125,8 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
             _buildChip('Expenses', 'expense'),
             const SizedBox(width: 8),
             _buildChip('Income', 'income'),
+            const SizedBox(width: 8),
+            _buildChip('Transfers', 'transfer'),
           ],
         ),
       ),
@@ -254,26 +256,208 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   }
 
   Widget _buildTransactionTile(Transaction transaction) {
+    if (transaction.type == 'transfer') return _buildTransferTile(transaction);
     final category = _categories.firstWhere(
       (c) => c.id == transaction.categoryId,
       orElse: () => _defaultCategory(),
     );
     final isExpense = transaction.type == 'expense';
     final color = Color(category.colorValue);
+    // A duplicate is a real statement line kept on file but left out of every
+    // total — shown greyed so it can be spotted and put back if wrong.
+    final isDuplicate = transaction.status == kDuplicateStatus;
 
+    return Opacity(
+      opacity: isDuplicate ? 0.55 : 1,
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
+        decoration: woCard(radius: 18),
+        child: ListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          leading: WoIconBubble(
+            isDuplicate ? CupertinoIcons.doc_on_doc : _getCategoryIcon(category.icon),
+            color: isDuplicate ? WoColors.textLo : color,
+            size: 46,
+          ),
+          title: Text(transaction.description, style: WoText.subtitle(), maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+            isDuplicate ? 'Duplicate · not counted in totals' : category.name,
+            style: WoText.caption(),
+          ),
+          trailing: Text(
+            '${isExpense ? "-" : "+"}${CurrencyUtils.format(transaction.amountSource, transaction.currencyCode, decimals: 2)}',
+            style: WoText.num(
+              color: isDuplicate
+                  ? WoColors.textLo
+                  : (isExpense ? WoColors.expense : WoColors.income),
+            ),
+          ),
+          onTap: () => isDuplicate
+              ? _showDuplicateSheet(transaction)
+              : _showEditTransactionSheet(transaction),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showDuplicateSheet(Transaction t) async {
+    final twin = t.linkedTransactionId != null
+        ? await _repo!.getTransactionById(t.linkedTransactionId!)
+        : null;
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => WoSheet(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Duplicate spend', style: WoText.title()),
+            const SizedBox(height: 8),
+            Text(t.description, style: WoText.bodyHi()),
+            const SizedBox(height: 6),
+            Text(
+              twin != null
+                  ? 'Treated as the same purchase as "${twin.description}" on '
+                      '${_accountName(twin.accountId)}, so it is left out of your totals.'
+                  : 'Left out of your totals as a duplicate.',
+              style: WoText.caption(),
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                style: WoButtons.primary,
+                onPressed: () async {
+                  final ok = await _repo!.restoreDuplicate(t.id);
+                  if (!ctx.mounted) return;
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text(ok
+                        ? 'Restored — counted in your totals again'
+                        : 'Could not restore'),
+                  ));
+                  _loadData();
+                },
+                child: const Text('Not a duplicate — count it'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _accountName(String? id) =>
+      _accounts.where((a) => a.id == id).firstOrNull?.name ?? 'Account';
+
+  /// A transfer is money moving between two of the user's own accounts. It
+  /// used to render as a green "+income" on the SOURCE account; now it reads
+  /// as what it is, with both legs when the currencies differ.
+  Widget _buildTransferTile(Transaction t) {
+    final label = switch (t.txnClass) {
+      'cc_payment' => 'Card payment',
+      'investment' => 'Investment contribution',
+      'debt' => 'Loan instalment',
+      _ => 'Transfer',
+    };
+    final sent = CurrencyUtils.format(t.amountSource, t.currencyCode, decimals: 2);
+    final received = (t.toAmount != null && t.toCurrency != null)
+        ? CurrencyUtils.format(t.toAmount!, t.toCurrency!, decimals: 2)
+        : null;
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
       decoration: woCard(radius: 18),
       child: ListTile(
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        leading: WoIconBubble(_getCategoryIcon(category.icon), color: color, size: 46),
-        title: Text(transaction.description, style: WoText.subtitle(), maxLines: 1, overflow: TextOverflow.ellipsis),
-        subtitle: Text(category.name, style: WoText.caption()),
-        trailing: Text(
-          '${isExpense ? "-" : "+"}${CurrencyUtils.format(transaction.amountSource, transaction.currencyCode, decimals: 2)}',
-          style: WoText.num(color: isExpense ? WoColors.expense : WoColors.income),
+        leading: WoIconBubble(CupertinoIcons.arrow_right_arrow_left, color: WoColors.indigo, size: 46),
+        title: Text(t.description, style: WoText.subtitle(), maxLines: 1, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          '$label · ${_accountName(t.accountId)} → ${_accountName(t.transferAccountId)}',
+          style: WoText.caption(), maxLines: 1, overflow: TextOverflow.ellipsis,
         ),
-        onTap: () => _showEditTransactionSheet(transaction),
+        trailing: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(sent, style: WoText.num(color: WoColors.textHi)),
+            if (received != null)
+              Text('→ $received', style: WoText.caption(color: WoColors.textMid)),
+          ],
+        ),
+        onTap: () => _showTransferSheet(t),
+      ),
+    );
+  }
+
+  Future<void> _showTransferSheet(Transaction t) async {
+    final leg = t.linkedTransactionId != null
+        ? await _repo!.getTransactionById(t.linkedTransactionId!)
+        : null;
+    final canUnmerge = leg != null && leg.status == kMergedStatus;
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => WoSheet(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Transfer', style: WoText.title()),
+            const SizedBox(height: 8),
+            Text(t.description, style: WoText.bodyHi()),
+            const SizedBox(height: 4),
+            Text(
+              '${_accountName(t.accountId)} → ${_accountName(t.transferAccountId)} · '
+              '${DateFormat('MMM d, yyyy').format(t.transactionDate)}',
+              style: WoText.caption(),
+            ),
+            if (canUnmerge) ...[
+              const SizedBox(height: 14),
+              Text(
+                'Matched from two statement lines. Unmerging restores both as '
+                'separate income and expense entries.',
+                style: WoText.caption(color: WoColors.textMid),
+              ),
+            ],
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                if (canUnmerge)
+                  Expanded(
+                    child: OutlinedButton(
+                      style: WoButtons.ghost,
+                      onPressed: () async {
+                        final ok = await _repo!.unmergeTransferPair(t.id);
+                        if (!ctx.mounted) return;
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(ok ? 'Unmerged — both entries restored' : 'Could not unmerge'),
+                        ));
+                        _loadData();
+                      },
+                      child: const Text('Unmerge'),
+                    ),
+                  ),
+                if (canUnmerge) const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    style: WoButtons.primary,
+                    onPressed: () async {
+                      await _repo!.deleteTransaction(t.id);
+                      if (!ctx.mounted) return;
+                      Navigator.pop(ctx);
+                      _loadData();
+                    },
+                    child: const Text('Delete'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }

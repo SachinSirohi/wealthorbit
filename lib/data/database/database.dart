@@ -77,6 +77,19 @@ class Transactions extends Table {
   TextColumn get status => text().withDefault(const Constant('cleared'))();
   // Links an auto-imported transaction to a manually-entered duplicate.
   TextColumn get linkedTransactionId => text().nullable()();
+  // CROSS-CURRENCY TRANSFERS. A transfer is one row: amountSource leaves the
+  // source account in currencyCode. When the destination is in another
+  // currency (AED Wio → INR Kotak) the amount that ARRIVES is different by
+  // the FX factor; it lives here. Null means same currency, same amount.
+  RealColumn get toAmount => real().nullable()();
+  TextColumn get toCurrency => text().nullable()();
+  // What kind of movement the statement line is (purchase, income,
+  // own_transfer, cc_payment, investment, fee) — derived at import and used
+  // as a prior by transfer matching.
+  TextColumn get txnClass => text().nullable()();
+  // Set when an imported EMI / loan instalment has been applied against a
+  // Liabilities row, so re-syncs never reduce the outstanding twice.
+  TextColumn get liabilityId => text().nullable()();
   DateTimeColumn get transactionDate => dateTime()();
   TextColumn get sourceStatementId => text().nullable()(); // Link to parsed statement
   BoolColumn get isRecurring => boolean().withDefault(const Constant(false))();
@@ -180,7 +193,13 @@ class StatementSources extends Table {
 // ═══════════════════════════════════════════════════════════════════════════
 class StatementQueue extends Table {
   TextColumn get id => text()();
-  TextColumn get emailId => text()(); // Gmail message ID
+  TextColumn get emailId => text()(); // IMAP UID — unique only WITHIN a mailbox
+  // Which connected mailbox [emailId] belongs to. IMAP UIDs are per-mailbox,
+  // so a UID alone is ambiguous once a second account is connected: the
+  // worker would fetch whatever unrelated message held that UID in the other
+  // mailbox. Rows are keyed `q_<accountEmail>_<uid>` and fetched only from
+  // their owning client. Null on rows created before this column existed.
+  TextColumn get accountEmail => text().nullable()();
   TextColumn get sourceId => text().nullable().references(StatementSources, #id)();
   TextColumn get subject => text()();
   TextColumn get status => text().withDefault(const Constant('pending'))(); // pending, processing, completed, failed
@@ -366,6 +385,53 @@ class MerchantCategories extends Table {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SUGGESTED_MATCHES TABLE (AI transfer / CC payment proposals)
+// ═══════════════════════════════════════════════════════════════════════════
+class SuggestedMatches extends Table {
+  TextColumn get id => text()();
+  TextColumn get fromTxnId => text().references(Transactions, #id)();
+  TextColumn get toTxnId => text().references(Transactions, #id)();
+  TextColumn get kind => text()(); // own_transfer, cc_payment, duplicate_spend
+  RealColumn get confidence => real()();
+  TextColumn get reason => text().nullable()();
+  TextColumn get status => text().withDefault(const Constant('pending'))(); // pending, accepted, rejected
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSFER_PATTERNS TABLE (learned counterparty → account shortcuts)
+// ═══════════════════════════════════════════════════════════════════════════
+class TransferPatterns extends Table {
+  TextColumn get id => text()();
+  TextColumn get pattern => text()(); // normalized substring from description
+  TextColumn get targetAccountId => text().references(Accounts, #id)();
+  TextColumn get kind => text().withDefault(const Constant('own_transfer'))();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COACH_REPORTS TABLE (Monthly Financial Health Coach wraps)
+// ═══════════════════════════════════════════════════════════════════════════
+class CoachReports extends Table {
+  TextColumn get id => text()();
+  IntColumn get year => integer()();
+  IntColumn get month => integer()(); // 1-12
+  DateTimeColumn get generatedAt => dateTime().withDefault(currentDateAndTime)();
+  TextColumn get snapshotJson => text()();
+  TextColumn get reportJson => text()();
+  RealColumn get score => real().withDefault(const Constant(0.0))();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DATABASE CLASS
 // ═══════════════════════════════════════════════════════════════════════════
 @DriftDatabase(tables: [
@@ -389,6 +455,9 @@ class MerchantCategories extends Table {
   FinancialInsights,
   NetWorthSnapshots,
   MerchantCategories,
+  SuggestedMatches,
+  TransferPatterns,
+  CoachReports,
 ])
 class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(_openConnection());
@@ -397,7 +466,12 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 10;
+
+  /// Flush WAL into the main sqlite file so a file copy is consistent.
+  Future<void> checkpointWal() async {
+    await customStatement('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -434,6 +508,26 @@ class AppDatabase extends _$AppDatabase {
       if (from < 7) {
         await m.addColumn(statementSources, statementSources.lastProcessedUid);
         await _seedIncomeCategories();
+      }
+      // v8: AI transfer suggestions + monthly financial health coach.
+      if (from < 8) {
+        await m.createTable(suggestedMatches);
+        await m.createTable(transferPatterns);
+        await m.createTable(coachReports);
+      }
+      // v9: queue rows remember which mailbox their UID came from, so a
+      // second connected account cannot collide with the first.
+      if (from < 9) {
+        await m.addColumn(statementQueue, statementQueue.accountEmail);
+      }
+      // v10: cross-currency transfer legs, persisted transaction class,
+      // EMI→liability links, and a category for bank/FX fees.
+      if (from < 10) {
+        await m.addColumn(transactions, transactions.toAmount);
+        await m.addColumn(transactions, transactions.toCurrency);
+        await m.addColumn(transactions, transactions.txnClass);
+        await m.addColumn(transactions, transactions.liabilityId);
+        await _seedFeeCategory();
       }
     },
     beforeOpen: (details) async {
@@ -486,15 +580,31 @@ class AppDatabase extends _$AppDatabase {
         CategoriesCompanion.insert(id: 'cat_investments', name: 'Investments', budgetType: 'future', icon: const Value('chart.bar'), colorValue: const Value(0xFF30D158)),
         CategoriesCompanion.insert(id: 'cat_savings', name: 'Savings', budgetType: 'future', icon: const Value('banknote'), colorValue: const Value(0xFF32ADE6)),
         CategoriesCompanion.insert(id: 'cat_debt', name: 'Debt Repayment', budgetType: 'future', icon: const Value('creditcard'), colorValue: const Value(0xFFFF6482)),
+        CategoriesCompanion.insert(id: 'cat_fees', name: 'Bank & FX Fees', budgetType: 'needs', icon: const Value('percent'), colorValue: const Value(0xFF8E8E93)),
       ]);
     });
   }
+
+  /// Remittance / FX / bank charges. The difference between what leaves one
+  /// account and what arrives in another is booked here, so it is neither
+  /// lost nor mistaken for spending at a merchant.
+  Future<void> _seedFeeCategory() async {
+    await into(categories).insertOnConflictUpdate(
+      CategoriesCompanion.insert(id: 'cat_fees', name: 'Bank & FX Fees', budgetType: 'needs', icon: const Value('percent'), colorValue: const Value(0xFF8E8E93)),
+    );
+  }
+}
+
+const String kWealthOrbitDbFileName = 'wealth_orbit.sqlite';
+
+Future<File> wealthOrbitDatabaseFile() async {
+  final dbFolder = await getApplicationDocumentsDirectory();
+  return File(p.join(dbFolder.path, kWealthOrbitDbFileName));
 }
 
 LazyDatabase _openConnection() {
   return LazyDatabase(() async {
-    final dbFolder = await getApplicationDocumentsDirectory();
-    final file = File(p.join(dbFolder.path, 'wealth_orbit.sqlite'));
+    final file = await wealthOrbitDatabaseFile();
     return NativeDatabase.createInBackground(file);
   });
 }

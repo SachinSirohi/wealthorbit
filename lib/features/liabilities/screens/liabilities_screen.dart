@@ -337,11 +337,14 @@ class _AddLiabilitySheetState extends State<_AddLiabilitySheet> {
   DateTime _startDate = DateTime.now();
   double _calculatedEmi = 0;
 
-  final _types = [
+  List<(String, String, IconData)> get _types => [
     ('home_loan', 'Home Loan', Icons.home),
     ('vehicle_loan', 'Vehicle Loan', Icons.directions_car),
     ('personal_loan', 'Personal Loan', Icons.person),
-    ('credit_card', 'Credit Card', Icons.credit_card),
+    // Credit cards are tracked as ACCOUNTS (their statement balance is the
+    // debt). Offering them here too let the same debt be entered twice.
+    if (widget.liability?.type == 'credit_card')
+      ('credit_card', 'Credit Card (legacy — tracked on Accounts)', Icons.credit_card),
     ('other', 'Other', Icons.account_balance),
   ];
 

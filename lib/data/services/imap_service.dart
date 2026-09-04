@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:enough_mail/enough_mail.dart';
+import '../../core/statement_backlog.dart';
 import '../models/discovered_source.dart';
 import 'secure_vault.dart';
 
@@ -90,6 +91,18 @@ class ImapService {
   bool get isConnected => _client != null && _client!.isConnected;
 
   /// Discover statement senders from inbox using optimized search
+  /// Subjects worth extracting.
+  ///
+  /// Bank vocabulary alone missed portfolio mail: a CDSL/NSDL CAS, a demat
+  /// holdings report or an NPS statement is where stock and fund positions
+  /// live, and none of them are guaranteed to say "statement". Short tokens
+  /// are matched at word boundaries — a bare `contains('cas')` would fire on
+  /// "purchase", and `contains('nps')` on nothing useful at all.
+  static final RegExp _statementSubjectRx = RegExp(
+    r'statement|e-?statement|summary|transaction|credit card|bank|'
+    r'portfolio|holding|\bdemat\b|\bfolio\b|\bcas\b|\be-?cas\b|\bnps\b',
+  );
+
   /// Format a DateTime as an IMAP SEARCH date (e.g. `12-Jun-2024`).
   static String _imapDate(DateTime d) {
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -115,15 +128,16 @@ class ImapService {
     return out;
   }
 
-  /// Default window: 24 months — statements live deep in the mailbox, far
-  /// beyond the most recent few hundred emails.
-  Future<List<DiscoveredSource>> discoverStatementSenders({int daysBack = 730}) async {
+  /// Default window: last 3 years of statement mail.
+  Future<List<DiscoveredSource>> discoverStatementSenders({
+    int daysBack = StatementBacklog.lookbackDays,
+  }) async {
     if (!isConnected) throw Exception('Not connected to IMAP');
 
     // Reuse a recent discovery instead of re-fetching/parsing hundreds of
     // envelopes again (the discovery, password and extraction screens all call
     // this — repeating it on the UI isolate was a primary ANR cause).
-    final cacheKey = account?.email ?? 'default';
+    final cacheKey = '${account?.email ?? 'default'}:$daysBack';
     final cached = _sourceCache[cacheKey];
     final cachedAt = _discoveryAt[cacheKey];
     if (cached != null &&
@@ -161,7 +175,9 @@ class ImapService {
         final months = (daysBack / 30).ceil();
         final res = await _client!.searchMessages(
           searchCriteria:
-              'X-GM-RAW "subject:(statement OR estatement OR e-statement OR summary OR transaction) has:attachment newer_than:${months}m"',
+              'X-GM-RAW "subject:(statement OR estatement OR e-statement OR summary OR '
+              'transaction OR portfolio OR holdings OR demat OR folio OR CAS OR NPS) '
+              'has:attachment newer_than:${months}m"',
         );
         final ids = res.matchingSequence?.toList() ?? <int>[];
         debugPrint('📬 Gmail X-GM-RAW matched ${ids.length} messages');
@@ -179,7 +195,9 @@ class ImapService {
         try {
           final since = _imapDate(DateTime.now().subtract(Duration(days: daysBack)));
           final ids = <int>{};
-          for (final term in ['statement', 'summary', 'transaction']) {
+          for (final term in [
+            'statement', 'summary', 'transaction', 'portfolio', 'holdings'
+          ]) {
             try {
               final r = await _client!
                   .searchMessages(searchCriteria: 'SINCE $since SUBJECT "$term"');
@@ -272,14 +290,9 @@ class ImapService {
         final from = (fromList != null && fromList.isNotEmpty ? fromList.first.email : '').toLowerCase();
         if (from.isEmpty) continue;
         
-        // Check if subject contains statement-related keywords
+        // Does this subject look like a statement we can extract?
         final subject = msg.decodeSubject()?.toLowerCase() ?? '';
-        final isMatch = subject.contains('statement') ||
-            subject.contains('e-statement') ||
-            subject.contains('summary') ||
-            subject.contains('transaction') ||
-            subject.contains('credit card') ||
-            subject.contains('bank');
+        final isMatch = _statementSubjectRx.hasMatch(subject);
             
         if (isMatch) {
           senderMap.putIfAbsent(from, () => []);
@@ -387,13 +400,20 @@ class ImapService {
   }
 
   /// Search for emails from specific senders
-  Future<List<MimeMessage>> searchStatementEmails(List<String> senders, {int daysBack = 365}) async {
+  Future<List<MimeMessage>> searchStatementEmails(
+    List<String> senders, {
+    int daysBack = StatementBacklog.lookbackDays,
+  }) async {
     if (!isConnected) throw Exception('Not connected to IMAP');
 
+    final cutoff = DateTime.now().subtract(Duration(days: daysBack));
     final relevantMessages = _cachedHeaders.where((msg) {
       final f = msg.from;
       final from = (f != null && f.isNotEmpty ? f.first.email : '').toLowerCase();
-      return senders.any((s) => from.contains(s.toLowerCase()));
+      if (!senders.any((s) => from.contains(s.toLowerCase()))) return false;
+      final date = msg.decodeDate();
+      if (date != null && date.isBefore(cutoff)) return false;
+      return true;
     }).toList();
     
     // Sort by date descending (newest first)

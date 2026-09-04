@@ -24,6 +24,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
   List<Account> _accounts = [];
   bool _isLoading = true;
   double _totalBalance = 0;
+  double _cardDebt = 0;
   String _base = 'AED';
 
   @override
@@ -53,12 +54,14 @@ class _AccountsScreenState extends State<AccountsScreen> {
       if (!mounted) return;
       // Convert each account to the base currency for the headline total.
       final total = await _repo!.getTotalAccountBalance();
+      final cardDebt = await _repo!.getCreditCardOutstanding();
       final base = await SecureVault.getBaseCurrency();
 
       if (!mounted) return;
       setState(() {
         _accounts = accounts;
         _totalBalance = total;
+        _cardDebt = cardDebt;
         _base = base;
         _isLoading = false;
       });
@@ -145,11 +148,17 @@ class _AccountsScreenState extends State<AccountsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('TOTAL BALANCE', style: WoText.label(color: WoColors.gold)),
+            Text('CASH BALANCE', style: WoText.label(color: WoColors.gold)),
             const SizedBox(height: 10),
             Text(CurrencyUtils.format(_totalBalance, _base, decimals: 2), style: WoText.hero()),
             const SizedBox(height: 6),
-            Text('${_accounts.length} accounts connected', style: WoText.caption(color: WoColors.textLo)),
+            Text(
+              _cardDebt > 0
+                  // The headline deliberately excludes credit cards; saying so
+                  // stops it reading as net position when a card is in debt.
+                  ? '${_accounts.length} accounts · ${CurrencyUtils.format(_cardDebt, _base, decimals: 0)} card debt not included'
+                  : '${_accounts.length} accounts connected',
+              style: WoText.caption(color: WoColors.textLo)),
           ],
         ),
       ).animate().fadeIn().slideY(begin: 0.1),
@@ -210,6 +219,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       'wallet': 'Digital Wallets',
       'cash': 'Cash',
       'investment': 'Investment Accounts',
+      'brokerage': 'Brokerage · net contributions',
     };
     return labels[type] ?? type.toUpperCase();
   }
@@ -221,6 +231,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       'wallet': CupertinoIcons.money_dollar_circle_fill,
       'cash': CupertinoIcons.money_dollar,
       'investment': CupertinoIcons.chart_bar_fill,
+      'brokerage': CupertinoIcons.graph_square_fill,
     };
 
     final typeColors = {
@@ -229,6 +240,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       'wallet': WoColors.indigo,
       'cash': WoColors.mint,
       'investment': WoColors.gold,
+      'brokerage': WoColors.gold,
     };
 
     final icon = typeIcons[account.type] ?? CupertinoIcons.circle;
@@ -241,9 +253,13 @@ class _AccountsScreenState extends State<AccountsScreen> {
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         leading: WoIconBubble(icon, color: color, size: 46),
         title: Text(account.name, style: WoText.subtitle()),
-        subtitle: account.institution != null
-            ? Text(account.institution!, style: WoText.caption())
-            : null,
+        // A brokerage balance is money sent in minus money taken out — the
+        // holdings themselves live on the Invest tab, so this is not cash.
+        subtitle: account.type == 'brokerage'
+            ? Text('Contributions · holdings on Invest tab', style: WoText.caption())
+            : account.institution != null
+                ? Text(account.institution!, style: WoText.caption())
+                : null,
         trailing: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.end,

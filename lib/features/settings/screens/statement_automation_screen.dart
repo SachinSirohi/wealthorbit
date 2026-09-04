@@ -4,7 +4,10 @@ import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:drift/drift.dart' show Value;
+import 'package:intl/intl.dart';
 import '../../../core/theme/wo_design.dart';
+import '../../../core/statement_backlog.dart';
+import '../../../core/amount_sanity.dart';
 import '../../../data/database/database.dart';
 import '../../../data/repositories/app_repository.dart';
 import '../../../data/services/secure_vault.dart';
@@ -12,7 +15,11 @@ import '../../../data/services/imap_service.dart';
 import '../../../data/services/statement_processor.dart';
 import '../../../data/services/gemini_service.dart';
 import '../../../data/services/background_service.dart';
+import '../../../data/services/backup_service.dart';
+import '../../../data/services/reconciliation_service.dart';
+import '../../../data/services/financial_health_service.dart';
 import '../../onboarding/screens/statement_discovery_screen.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class StatementAutomationScreen extends StatefulWidget {
   const StatementAutomationScreen({super.key});
@@ -25,6 +32,7 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   AppRepository? _repo;
   List<StatementSource> _sources = [];
   List<StatementQueueData> _queue = [];
+  List<StatementQueueData> _failed = [];
   List<Account> _accounts = [];
   List<EmailAccount> _emailAccounts = [];
   bool _isLoading = true;
@@ -32,6 +40,7 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   bool _automationEnabled = false;
   bool _appLockEnabled = false;
   bool _isSyncing = false;
+  String _syncMessage = '';
 
   @override
   void initState() {
@@ -51,14 +60,17 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     }
   }
 
-  Future<void> _loadData() async {
+  Future<void> _loadData({bool showSpinner = true}) async {
     if (!mounted) return;
-    setState(() => _isLoading = true);
+    if (showSpinner) setState(() => _isLoading = true);
     
     try {
+      await _repo!.resetStuckProcessing();
       final sources = await _repo!.getAllStatementSources();
       if (!mounted) return;
       final queue = await _repo!.getPendingStatementQueue();
+      if (!mounted) return;
+      final failed = await _repo!.getFailedStatementQueue();
       if (!mounted) return;
       final accounts = await _repo!.getAllAccounts();
       if (!mounted) return;
@@ -71,6 +83,9 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
       setState(() {
         _sources = sources;
         _queue = queue;
+        _failed = failed
+            .where((f) => !isNonBankStatementSubject(f.subject))
+            .toList();
         _accounts = accounts;
         _emailAccounts = emailAccounts;
         _isGmailConnected = emailAccounts.isNotEmpty;
@@ -110,6 +125,8 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                    _buildGeminiCard(),
                    const SizedBox(height: 24),
                    _buildQueueSection(),
+                   const SizedBox(height: 24),
+                   _buildFailedQueueSection(),
                    const SizedBox(height: 24),
                    _buildSourcesSection(),
                    const SizedBox(height: 24),
@@ -204,7 +221,12 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
               icon: _isSyncing
                   ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: WoColors.gold))
                   : Icon(Icons.sync, color: WoColors.gold),
-              label: Text(_isSyncing ? 'Syncing…' : 'Sync Now', style: GoogleFonts.poppins(color: WoColors.gold)),
+              label: Text(
+                _isSyncing
+                    ? (_syncMessage.isEmpty ? 'Syncing…' : _syncMessage)
+                    : 'Sync Now',
+                style: GoogleFonts.poppins(color: WoColors.gold),
+              ),
             ),
           ],
         ],
@@ -229,6 +251,16 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
             ),
           ],
         ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: _reExtractProcessed,
+            style: TextButton.styleFrom(padding: EdgeInsets.zero, visualDensity: VisualDensity.compact),
+            icon: Icon(CupertinoIcons.arrow_2_circlepath, color: WoColors.textMid, size: 14),
+            label: Text('Re-extract processed statements',
+                style: GoogleFonts.inter(color: WoColors.textMid, fontSize: 12)),
+          ),
+        ),
         const SizedBox(height: 16),
         if (_queue.isEmpty)
           Container(
@@ -244,48 +276,303 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
               ],
             ),
           )
-        else
-          ListView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: _queue.length > 3 ? 3 : _queue.length,
-            itemBuilder: (context, index) {
-              final item = _queue[index];
-              return Container(
-                margin: const EdgeInsets.only(bottom: 12),
-                padding: const EdgeInsets.all(16),
-                decoration: woCard(radius: 16),
-                child: Row(
-                  children: [
-                    WoIconBubble(Icons.picture_as_pdf, color: WoColors.red, size: 36),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(item.subject, style: WoText.bodyHi(), maxLines: 1, overflow: TextOverflow.ellipsis),
-                          const SizedBox(height: 4),
-                          Row(
-                            children: [
-                              SizedBox(
-                                width: 12,
-                                height: 12,
-                                child: CircularProgressIndicator(strokeWidth: 2, color: WoColors.gold),
-                              ),
-                              const SizedBox(width: 8),
-                              Text('Processing...', style: GoogleFonts.inter(color: WoColors.gold, fontSize: 11)),
-                            ],
+        else ...[
+          if (_queue.length > StatementBacklog.drainBatchSize)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                'Newest ${StatementBacklog.drainBatchSize} shown. ${_queue.length - StatementBacklog.drainBatchSize} older statements from the last ${StatementBacklog.lookbackYears} years are queued — Sync Now processes ${StatementBacklog.drainBatchSize} at a time, newest first.',
+                style: WoText.caption(),
+              ),
+            ),
+          ..._queue.take(StatementBacklog.drainBatchSize).map((item) {
+            final waiting = item.status != 'processing';
+            final dateLabel = DateFormat.yMMMd().format(item.emailDate.toLocal());
+            return Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.all(16),
+              decoration: woCard(radius: 16),
+              child: Row(
+                children: [
+                  WoIconBubble(Icons.picture_as_pdf, color: WoColors.red, size: 36),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(item.subject, style: WoText.bodyHi(), maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 4),
+                        Text(
+                          waiting ? 'Queued · $dateLabel' : 'Processing · $dateLabel',
+                          style: GoogleFonts.inter(
+                            color: waiting ? WoColors.textMid : WoColors.gold,
+                            fontSize: 11,
                           ),
-                        ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildFailedQueueSection() {
+    if (_failed.isEmpty) return const SizedBox.shrink();
+
+    final passwordFails = _failed
+        .where((f) => (f.errorMessage ?? '').toLowerCase().contains('password'))
+        .length;
+    final timeouts = _failed
+        .where((f) => (f.errorMessage ?? '').toLowerCase().contains('timeout'))
+        .length;
+    // Statements that ran cleanly but produced no transactions. These used
+    // to be filed as `completed` and disappeared from view entirely.
+    final emptyResults = _failed.where((f) => f.status == 'empty').length;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: WoSectionHeader('Failed statements', padding: EdgeInsets.zero),
+            ),
+            WoChip('${_failed.length}', color: WoColors.red),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          [
+            if (passwordFails > 0) '$passwordFails need a PDF password',
+            if (timeouts > 0) '$timeouts timed out (retryable)',
+            if (emptyResults > 0) '$emptyResults imported nothing',
+            if (passwordFails == 0 && timeouts == 0 && emptyResults == 0)
+              'Tap an item to fix or retry',
+          ].where((s) => s.isNotEmpty).join(' · '),
+          style: WoText.caption(),
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            if (timeouts > 0)
+              TextButton.icon(
+                onPressed: _isSyncing ? null : () => _retryFailed(timeoutsOnly: true),
+                icon: Icon(Icons.refresh, color: WoColors.gold, size: 16),
+                label: Text('Retry timeouts',
+                    style: GoogleFonts.inter(color: WoColors.gold, fontSize: 12.5)),
+              ),
+            TextButton.icon(
+              onPressed: _isSyncing ? null : () => _retryFailed(timeoutsOnly: false),
+              icon: Icon(Icons.replay, color: WoColors.gold, size: 16),
+              label: Text('Retry all',
+                  style: GoogleFonts.inter(color: WoColors.gold, fontSize: 12.5)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        ..._failed.take(12).map((item) {
+          final err = item.errorMessage ?? 'Failed';
+          final needsPassword = err.toLowerCase().contains('password');
+          final dateLabel = DateFormat.yMMMd().format(item.emailDate.toLocal());
+          return Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(14),
+            decoration: woCard(radius: 16, tint: WoColors.red),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(item.subject,
+                    style: WoText.bodyHi(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 4),
+                Text('$dateLabel · $err',
+                    style: GoogleFonts.inter(color: WoColors.textMid, fontSize: 11),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    if (needsPassword && item.sourceId != null)
+                      TextButton(
+                        onPressed: () => _fixFailedPassword(item),
+                        child: Text('Set password & retry',
+                            style: GoogleFonts.inter(
+                                color: WoColors.gold,
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600)),
+                      )
+                    else
+                      TextButton(
+                        onPressed: () async {
+                          await _repo!.requeueStatementItem(item.id);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Re-queued — tap Sync Now')),
+                            );
+                            await _loadData(showSpinner: false);
+                          }
+                        },
+                        child: Text('Retry',
+                            style: GoogleFonts.inter(
+                                color: WoColors.gold,
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600)),
                       ),
+                    TextButton(
+                      onPressed: () async {
+                        await _repo!.deleteStatementQueueItem(item.id);
+                        await _loadData(showSpinner: false);
+                      },
+                      child: Text('Dismiss',
+                          style: GoogleFonts.inter(
+                              color: WoColors.textMid, fontSize: 12.5)),
                     ),
                   ],
                 ),
-              );
-            },
+              ],
+            ),
+          );
+        }),
+        if (_failed.length > 12)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text('+ ${_failed.length - 12} more failed',
+                style: WoText.caption()),
           ),
       ],
     );
+  }
+
+  /// Re-run statements already marked processed. Import guards have wrongly
+  /// rejected real lines before, and a completed statement is never looked at
+  /// again — this is the way to recover them. Dedupe means nothing already
+  /// imported comes back twice.
+  Future<void> _reExtractProcessed() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: WoColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
+        title: Text('Re-extract processed statements', style: WoText.title()),
+        content: Text(
+          'Runs every already-processed statement through extraction again, so '
+          'lines an earlier version wrongly skipped can be recovered. '
+          'Transactions you already have are not duplicated.\n\n'
+          'This re-queues a lot of work — Sync Now handles a batch at a time.',
+          style: WoText.body(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.poppins(color: WoColors.textMid)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: WoButtons.primary,
+            child: const Text('Re-extract'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final n = await _repo!.requeueCompletedStatements();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Re-queued $n statements — tap Sync Now')),
+    );
+    await _loadData(showSpinner: false);
+  }
+
+  Future<void> _retryFailed({required bool timeoutsOnly}) async {
+    final n = await _repo!.requeueFailedStatements(timeoutsOnly: timeoutsOnly);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Re-queued $n statements — tap Sync Now')),
+    );
+    await _loadData(showSpinner: false);
+  }
+
+  /// What this particular institution protects its PDFs with. Brokers and
+  /// depositories in India use the PAN almost universally; banks vary, so
+  /// they get the general list. Saves guessing on the one that matters most.
+  String _passwordHint(String bankName, String senderEmail) {
+    final hay = '$bankName $senderEmail'.toLowerCase();
+    if (isBrokerageSender(hay)) {
+      return 'Brokers and depositories (Zerodha, CDSL, NSDL, CAMS, NPS) use your '
+          'PAN in CAPITALS — e.g. ABCDE1234F. Entered once, it is reused for the '
+          'others automatically.';
+    }
+    return 'Banks state the format in the statement email — usually date of '
+        'birth (DDMMYYYY), PAN, or the last 4 digits of the account or card.';
+  }
+
+  Future<void> _fixFailedPassword(StatementQueueData item) async {
+    final sourceId = item.sourceId;
+    if (sourceId == null) return;
+    final source = _sources.where((s) => s.id == sourceId).firstOrNull;
+    final controller = TextEditingController(
+      text: await SecureVault.getPdfPassword(sourceId) ?? '',
+    );
+    if (!mounted) return;
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: WoColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
+        title: Text(
+          '${source?.bankName ?? 'Statement'} PDF password',
+          style: WoText.title(),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(item.subject, style: WoText.caption(), maxLines: 2),
+            const SizedBox(height: 10),
+            Text(_passwordHint(source?.bankName ?? '', source?.senderEmail ?? ''),
+                style: WoText.caption(color: WoColors.textMid)),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              obscureText: true,
+              style: GoogleFonts.inter(color: WoColors.textHi),
+              decoration: woInput('Password'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.poppins(color: WoColors.textMid)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: WoButtons.primary,
+            child: const Text('Save & retry'),
+          ),
+        ],
+      ),
+    );
+    if (saved != true || !mounted) return;
+    await SecureVault.setPdfPasswordForSource(
+      sourceId: sourceId,
+      senderEmail: source?.senderEmail,
+      password: controller.text.trim(),
+    );
+    await _repo!.requeueStatementItem(item.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Password saved — tap Sync Now to process')),
+    );
+    await _loadData(showSpinner: false);
   }
 
   Widget _buildSourcesSection() {
@@ -429,30 +716,82 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   }
 
   Widget _buildSecurityCard() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: woCard(),
-      child: SwitchListTile(
-        value: _appLockEnabled,
-        activeThumbColor: WoColors.gold,
-        activeTrackColor: WoColors.goldDim,
-        onChanged: (v) async {
-          await _repo!.setAppSetting('biometric_enabled', v ? 'true' : 'false');
-          if (mounted) setState(() => _appLockEnabled = v);
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text(v ? 'App lock enabled — applies next launch' : 'App lock disabled')),
-            );
-          }
-        },
-        secondary: Icon(CupertinoIcons.lock_shield, color: WoColors.gold),
-        title: Text('App Lock (Biometric)', style: WoText.subtitle()),
-        subtitle: Text('Require Face/fingerprint to open the app', style: WoText.caption()),
-      ),
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: woCard(),
+          child: SwitchListTile(
+            value: _appLockEnabled,
+            activeThumbColor: WoColors.gold,
+            activeTrackColor: WoColors.goldDim,
+            onChanged: (v) async {
+              await _repo!.setAppSetting('biometric_enabled', v ? 'true' : 'false');
+              if (mounted) setState(() => _appLockEnabled = v);
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text(v ? 'App lock enabled — applies next launch' : 'App lock disabled')),
+                );
+              }
+            },
+            secondary: Icon(CupertinoIcons.lock_shield, color: WoColors.gold),
+            title: Text('App Lock (Biometric)', style: WoText.subtitle()),
+            subtitle: Text('Require Face/fingerprint to open the app', style: WoText.caption()),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: woCard(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  WoIconBubble(CupertinoIcons.arrow_down_doc, color: WoColors.gold, size: 42),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Phone transfer', style: WoText.subtitle()),
+                        Text(
+                          'Encrypted backup of accounts, transactions, PDF passwords, and mail passwords. Only WealthOrbit can open the file.',
+                          style: WoText.caption(),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () => BackupService.showExportFlow(context),
+                      icon: const Icon(CupertinoIcons.share, size: 16),
+                      label: const Text('Export'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () => BackupService.showImportFlow(context),
+                      icon: const Icon(CupertinoIcons.tray_arrow_down, size: 16),
+                      label: const Text('Restore'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
-  /// Gemini AI status + key management. Extraction can't run without a key,
+  /// AI engine status + key management. Extraction can't run without a key,
   /// so its state must be visible at a glance.
   Widget _buildGeminiCard() {
     return FutureBuilder<bool>(
@@ -477,10 +816,10 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Gemini AI', style: WoText.subtitle()),
+                      Text('WealthOrbit AI', style: WoText.subtitle()),
                       Text(
                         configured
-                            ? 'API key configured — extraction enabled'
+                            ? 'qwen-14b · extraction enabled'
                             : 'No API key — statements cannot be extracted. Tap to add.',
                         style: GoogleFonts.inter(
                           color: configured ? WoColors.textMid : WoColors.orange,
@@ -514,13 +853,13 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
         builder: (ctx, setDialogState) => AlertDialog(
           backgroundColor: WoColors.surface,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
-          title: Text('Gemini API Key', style: WoText.title()),
+          title: Text('AI API Key', style: WoText.title()),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Free key from aistudio.google.com → "Get API key". Used on-device to read your statement PDFs.',
+                'Used to read statement PDFs via qwen-14b. A built-in key is already configured; paste a replacement only if you need to rotate it.',
                 style: WoText.caption(),
               ),
               const SizedBox(height: 14),
@@ -577,7 +916,12 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   /// View/update the PDF password used to open this source's statements.
   Future<void> _showPdfPasswordDialog(StatementSource source) async {
     final controller = TextEditingController(
-      text: await SecureVault.getPdfPassword(source.id) ?? '',
+      text: await SecureVault.resolvePdfPassword(
+            sourceId: source.id,
+            senderEmail: source.senderEmail,
+            bankName: source.bankName,
+          ) ??
+          '',
     );
     if (!mounted) return;
     await showDialog<void>(
@@ -590,11 +934,8 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Banks usually mention the password format in the statement email '
-              '(e.g. date of birth + last 4 card digits).',
-              style: WoText.caption(),
-            ),
+            Text(_passwordHint(source.bankName, source.senderEmail),
+                style: WoText.caption()),
             const SizedBox(height: 14),
             TextField(
               controller: controller,
@@ -610,7 +951,11 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              await SecureVault.setPdfPassword(source.id, controller.text);
+              await SecureVault.setPdfPasswordForSource(
+                sourceId: source.id,
+                senderEmail: source.senderEmail,
+                password: controller.text,
+              );
               if (ctx.mounted) Navigator.pop(ctx);
             },
             style: WoButtons.primary,
@@ -751,6 +1096,7 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     await _repo!.setAppSetting('automation_enabled', enabled ? 'true' : 'false');
     try {
       if (enabled) {
+        await Permission.ignoreBatteryOptimizations.request();
         await BackgroundService.initialize();
         await BackgroundService.registerTasks();
       } else {
@@ -811,25 +1157,29 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
       }
 
       final statementId = DateTime.now().millisecondsSinceEpoch.toString();
-      final count = await StatementProcessor(_repo!).processPdf(
+      final imported = await StatementProcessor(_repo!).processPdf(
         bytes: bytes,
         accountId: accountId,
         statementId: statementId,
       );
 
-      // Record a completed queue entry for history.
+      // Record the outcome for history — `empty` when nothing was imported,
+      // so the reason stays visible in the failed list.
       await _repo!.insertStatementQueueItem(StatementQueueCompanion.insert(
         id: statementId,
         emailId: 'manual_upload',
         subject: 'Manual Upload: ${result.files.single.name}',
         emailDate: DateTime.now(),
-        status: const Value('completed'),
+        status: Value(imported.isEmpty ? 'empty' : 'completed'),
+        errorMessage: Value(imported.emptyReason),
         processedAt: Value(DateTime.now()),
       ));
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(count > 0 ? '✅ Imported $count transactions' : 'No transactions found in statement')),
+          SnackBar(content: Text(imported.imported > 0
+              ? '✅ Imported ${imported.imported} transactions'
+              : imported.emptyReason ?? 'No transactions found in statement')),
         );
       }
       _loadData();
@@ -966,14 +1316,39 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
       return;
     }
 
-    setState(() => _isSyncing = true);
+    setState(() {
+      _isSyncing = true;
+      _syncMessage = 'Starting queue…';
+    });
     final processor = StatementProcessor(_repo!);
-    final defaultAccountId = _accounts.first.id;
     final emailAccounts = await SecureVault.getEmailAccounts();
     int totalImported = 0;
     int failures = 0;
     final syncedSources = <String>{};
+    final unmappedSources = <String>{};
     try {
+      // Drain the IMAP queue first. Sync used to only fetch the latest email
+      // per sender, which left a 2-year backlog sitting as "pending".
+      await BackgroundService.processStatementQueueNow(
+        maxItems: StatementBacklog.drainBatchSize,
+        onProgress: (msg) {
+          if (!mounted) return;
+          setState(() => _syncMessage = msg);
+          _loadData(showSpinner: false);
+        },
+      );
+      await _loadData(showSpinner: false);
+      final stillQueued = _queue.length;
+      if (stillQueued > StatementBacklog.drainBatchSize) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                'Processed a batch. $stillQueued still queued — tap Sync Now again.'),
+          ));
+        }
+        return;
+      }
+      setState(() => _syncMessage = 'Checking latest per bank…');
       // Search every connected mailbox; a source's statements may live in any.
       for (final emailAccount in emailAccounts) {
         final imap = ImapService(account: emailAccount);
@@ -984,7 +1359,9 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
             continue;
           }
           // Prime the header cache so per-sender lookups work.
-          await imap.discoverStatementSenders(daysBack: 730);
+          await imap.discoverStatementSenders(
+            daysBack: StatementBacklog.incrementalFetchDays,
+          );
 
           for (final source in sources) {
             if (syncedSources.contains(source.id)) continue;
@@ -1002,24 +1379,45 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
             }
 
             final pdfs = await imap.extractPdfAttachments(message);
-            final password = await SecureVault.getPdfPassword(source.id);
-            final accountId = source.accountId ?? defaultAccountId;
+            // Resolve across every key space onboarding and settings write to.
+            final password = await SecureVault.resolvePdfPassword(
+              sourceId: source.id,
+              senderEmail: source.senderEmail,
+              bankName: source.bankName,
+            );
+            // Never fall back to "the first account": that relabels this
+            // bank's amounts with another account's currency.
+            final accountId = source.accountId;
+            if (accountId == null) {
+              failures++;
+              unmappedSources.add(source.bankName);
+              debugPrint('⏭️ ${source.bankName}: no account mapped — skipped');
+              continue;
+            }
             final brokerage = isBrokerageSender('${source.bankName} ${source.senderEmail}');
             try {
               for (final pdf in pdfs) {
-                totalImported += brokerage
+                final result = brokerage
                     ? await processor.processBrokeragePdf(
                         bytes: pdf,
                         accountId: accountId,
                         pdfPassword: password,
                         bankName: source.bankName,
+                        sourceId: source.id,
+                        senderEmail: source.senderEmail,
                       )
                     : await processor.processPdf(
                         bytes: pdf,
                         accountId: accountId,
                         pdfPassword: password,
                         statementId: source.id,
+                        sourceId: source.id,
+                        senderEmail: source.senderEmail,
                       );
+                totalImported += result.imported;
+                if (result.isEmpty && result.emptyReason != null) {
+                  debugPrint('⚪️ ${source.bankName}: ${result.emptyReason}');
+                }
               }
               syncedSources.add(source.id);
               if (uid != null) await _repo!.setSourceLastProcessedUid(source.id, uid);
@@ -1037,20 +1435,25 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
         }
       }
 
-      // Post-import smart pass: collapse own-account transfer pairs and
-      // seed this month's 50/30/20 budgets from detected income.
-      if (totalImported > 0) {
-        final transfers = await _repo!.detectInterAccountTransfers();
+      // Post-import smart pass: AI transfer matching + budgets.
+      try {
+        final reconMsg = await ReconciliationService(_repo!).run();
         final budgets = await _repo!.autoPopulateBudgets();
-        debugPrint('🤝 Auto-detected $transfers transfers, created $budgets budgets');
+        debugPrint('🤝 $reconMsg, created $budgets budgets');
+        await FinancialHealthService(_repo!).ensureCurrentMonthReport();
+      } catch (e) {
+        debugPrint('Post-sync reconciliation failed: $e');
       }
 
       if (mounted) {
+        final unmapped = unmappedSources.isEmpty
+            ? ''
+            : ' Map ${unmappedSources.join(', ')} to an account.';
         final msg = totalImported > 0
             ? '✅ Imported $totalImported transactions'
-                '${failures > 0 ? ' ($failures failed — check PDF passwords)' : ''}'
+                '${failures > 0 ? ' ($failures need attention)' : ''}$unmapped'
             : failures > 0
-                ? '⚠️ Sync finished with $failures failures — check PDF passwords & connection'
+                ? '⚠️ Nothing imported — $failures statement(s) need attention.$unmapped'
                 : 'No new statement transactions found';
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
@@ -1061,7 +1464,12 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
         );
       }
     } finally {
-      if (mounted) setState(() => _isSyncing = false);
+      if (mounted) {
+        setState(() {
+          _isSyncing = false;
+          _syncMessage = '';
+        });
+      }
       _loadData();
     }
   }

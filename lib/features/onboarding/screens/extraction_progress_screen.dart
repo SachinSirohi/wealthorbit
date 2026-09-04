@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import '../../../core/theme/wo_design.dart';
 import '../../../core/utils/currency_utils.dart';
+import '../../../core/statement_backlog.dart';
 import '../../../data/models/discovered_source.dart';
 import '../../../data/database/database.dart';
 import '../../../data/repositories/app_repository.dart';
@@ -9,6 +10,8 @@ import '../../../data/services/imap_service.dart';
 import '../../../data/services/secure_vault.dart';
 import '../../../data/services/statement_processor.dart';
 import '../../../data/services/notification_service.dart';
+import '../../../data/services/reconciliation_service.dart';
+import '../../../data/services/financial_health_service.dart';
 import 'package:drift/drift.dart' show Value;
 import 'package:go_router/go_router.dart';
 
@@ -30,13 +33,12 @@ class ExtractionProgressScreen extends StatefulWidget {
 class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
   final ImapService _imapService = ImapService();
   
-  int _totalStatements = 0;
-  int _processedStatements = 0;
   int _sourceNum = 0; // 1-based index of the bank currently being processed
   int get _totalSources => widget.sources.length;
   int _successfulExtractions = 0;
   int _failedExtractions = 0;
   int _importedTransactions = 0;
+  int _queuedForLater = 0;
   String _currentSource = '';
   String _currentStatus = 'Initializing...';
   bool _isComplete = false;
@@ -67,14 +69,15 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
     final processor = StatementProcessor(repo);
     final geminiReady = (await StatementProcessor.ensureGeminiReady()) == null;
 
-    // Calculate total statements
-    _totalStatements = widget.sources.fold(0, (sum, s) => sum + s.statementCount);
-    
     setState(() {
       _currentStatus = 'Connecting to email...';
     });
 
     try {
+      // Which mailbox these UIDs belong to — queue rows are namespaced by it
+      // so a second connected account can never collide with this one.
+      final mailboxEmail = (await SecureVault.getGmailEmail())?.toLowerCase();
+
       // Connect to IMAP
       final connected = await _imapService.connect();
       if (!connected) {
@@ -86,8 +89,11 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
       }
 
       // First, discover emails to populate cache
-      setState(() => _currentStatus = 'Scanning emails...');
-      await _imapService.discoverStatementSenders();
+      setState(() => _currentStatus =
+          'Scanning the last ${StatementBacklog.lookbackYears} years of statements...');
+      await _imapService.discoverStatementSenders(
+        daysBack: StatementBacklog.lookbackDays,
+      );
 
       // Process each source
       for (int i = 0; i < widget.sources.length; i++) {
@@ -101,7 +107,10 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
 
         // Get password for this source
         final password = widget.passwords[source.senderEmail] ??
-                         await SecureVault.getPdfPassword(source.senderEmail);
+            await SecureVault.resolvePdfPassword(
+              senderEmail: source.senderEmail,
+              bankName: source.senderName,
+            );
 
         // Reuse one account per bank (several sender addresses → one bank),
         // and tag it with the bank's real reporting currency so ₹ statements
@@ -110,15 +119,23 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
         final accountType = CurrencyUtils.isCreditCardHint('${source.senderName} ${source.senderEmail}')
             ? 'credit_card'
             : 'bank';
+        // Match on name AND type: a bank's savings statements and its credit
+        // card statements are DIFFERENT accounts. Matching on the name alone
+        // collapsed them into one row, which was then retyped as a card and
+        // re-signed as debt — the multi-million "credit card" balances.
         final existingAccounts = await repo.getAllAccounts();
         final existing = existingAccounts
-            .where((a) => a.name.toLowerCase() == source.senderName.toLowerCase())
+            .where((a) =>
+                a.name.toLowerCase() == source.senderName.toLowerCase() &&
+                a.type == accountType)
             .firstOrNull;
         final accountId = existing?.id ?? 'acct_${DateTime.now().millisecondsSinceEpoch}_$i';
         if (existing == null) {
           await repo.insertAccount(AccountsCompanion.insert(
             id: accountId,
-            name: source.senderName,
+            name: accountType == 'credit_card'
+                ? '${source.senderName} Card'
+                : source.senderName,
             type: accountType,
             currencyCode: currency,
           ));
@@ -134,25 +151,33 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
           accountId: Value(accountId),
         ));
         if (password != null && password.isNotEmpty) {
-          await SecureVault.setPdfPassword(sourceId, password);
+          await SecureVault.setPdfPasswordForSource(
+            sourceId: sourceId,
+            senderEmail: source.senderEmail,
+            password: password,
+          );
         }
 
-        // Get emails from this sender (uses cached headers, newest first).
-        // Cap to the most recent few — processing dozens of old emails per
-        // bank through AI is slow and rarely adds new statements.
+        // Newest [onboardImmediatePerSource] PDFs are extracted now so the
+        // dashboard has recent balances. The rest of the 3-year window is
+        // queued (newest first) for background / Sync Now.
         final allEmails = await _imapService.searchStatementEmails(
           [source.senderEmail],
+          daysBack: StatementBacklog.lookbackDays,
         );
-        const maxPerSource = 6;
-        final emails = allEmails.length > maxPerSource
-            ? allEmails.sublist(0, maxPerSource)
+        const maxImmediate = StatementBacklog.onboardImmediatePerSource;
+        final emails = allEmails.length > maxImmediate
+            ? allEmails.sublist(0, maxImmediate)
             : allEmails;
 
-        debugPrint('📧 Found ${allEmails.length} emails from ${source.senderEmail}; processing ${emails.length}');
+        debugPrint(
+            '📧 ${allEmails.length} emails from ${source.senderEmail}; extracting ${emails.length} now, queueing ${allEmails.length - emails.length}');
 
         // Process each email
         for (int j = 0; j < emails.length; j++) {
           final email = emails[j];
+          var queueStatus = 'pending';
+          String? queueError;
 
           setState(() {
             _currentStatus = '${source.senderName}: ${j + 1}/${emails.length}';
@@ -166,83 +191,120 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
             if (fullMessage == null) {
               debugPrint('⚠️ Could not fetch message uid=${email.uid} seq=${email.sequenceId}');
               _failedExtractions++;
-              _processedStatements++;
-              continue;
-            }
+            } else {
+              final pdfs = await _imapService.extractPdfAttachments(fullMessage);
 
-            // Extract PDF attachments
-            final pdfs = await _imapService.extractPdfAttachments(fullMessage);
-            
-            if (pdfs.isEmpty) {
-              // No PDF attachments - not a failure, just skip
-              _processedStatements++;
-              continue;
-            }
-
-            // Parse & save the first PDF's transactions into the account.
-            final pdfBytes = pdfs.first;
-            try {
-              if (geminiReady) {
-                final brokerage = isBrokerageSender('${source.senderName} ${source.senderEmail}');
-                final count = brokerage
-                    ? await processor.processBrokeragePdf(
-                        bytes: pdfBytes,
-                        accountId: accountId,
-                        pdfPassword: password,
-                        bankName: source.senderName,
-                      )
-                    : await processor.processPdf(
-                        bytes: pdfBytes,
-                        accountId: accountId,
-                        pdfPassword: password,
-                        statementId: sourceId,
-                      );
-                _importedTransactions += count;
-                _successfulExtractions++;
-                // Dedupe cursor: remember the newest extracted statement.
-                final uid = email.uid;
-                if (uid != null) {
-                  await repo.setSourceLastProcessedUid(sourceId, uid);
-                }
-                debugPrint('✅ Imported $count transactions from ${source.senderName}');
+              if (pdfs.isEmpty) {
+                queueStatus = 'empty';
+                queueError = 'This email had no PDF attachment.';
               } else {
-                // No Gemini key yet — sources are still configured for later sync.
-                _successfulExtractions++;
+                final pdfBytes = pdfs.first;
+                try {
+                  if (geminiReady) {
+                    final brokerage = isBrokerageSender('${source.senderName} ${source.senderEmail}');
+                    final result = brokerage
+                        ? await processor.processBrokeragePdf(
+                            bytes: pdfBytes,
+                            accountId: accountId,
+                            pdfPassword: password,
+                            bankName: source.senderName,
+                            sourceId: sourceId,
+                            senderEmail: source.senderEmail,
+                          )
+                        : await processor.processPdf(
+                            bytes: pdfBytes,
+                            accountId: accountId,
+                            pdfPassword: password,
+                            statementId: sourceId,
+                            sourceId: sourceId,
+                            senderEmail: source.senderEmail,
+                          );
+                    _importedTransactions += result.imported;
+                    if (result.isEmpty) {
+                      // Nothing imported is not success — keep it visible and
+                      // retryable instead of filing it as completed.
+                      queueStatus = 'empty';
+                      queueError = result.emptyReason;
+                      _failedExtractions++;
+                    } else {
+                      _successfulExtractions++;
+                      queueStatus = 'completed';
+                      final uid = email.uid;
+                      if (uid != null) {
+                        await repo.setSourceLastProcessedUid(sourceId, uid);
+                      }
+                    }
+                    debugPrint(
+                        '✅ Imported ${result.imported} transactions from ${source.senderName}'
+                        '${result.emptyReason != null ? ' · ${result.emptyReason}' : ''}');
+                  } else {
+                    // No AI key yet — leave queued so Sync Now can extract.
+                    _successfulExtractions++;
+                  }
+                } catch (e) {
+                  _failedExtractions++;
+                  queueStatus = 'failed';
+                  queueError = e.toString();
+                  debugPrint('❌ PDF processing failed: $e');
+                }
               }
-            } catch (e) {
-              _failedExtractions++;
-              debugPrint('❌ PDF processing failed: $e');
             }
-
           } catch (e) {
             _failedExtractions++;
             debugPrint('❌ Error processing email uid=${email.uid} seq=${email.sequenceId}: $e');
           }
 
-          setState(() {
-            _processedStatements++;
-          });
-          // Ongoing notification so progress is visible even if the user
-          // switches apps mid-extraction.
+          final uidStr = email.uid?.toString();
+          if (uidStr != null && uidStr.isNotEmpty) {
+            await repo.recordQueuedEmail(
+              emailId: uidStr,
+              subject: email.decodeSubject() ?? 'Statement',
+              emailDate: email.decodeDate() ?? DateTime.now(),
+              sourceId: sourceId,
+              accountEmail: mailboxEmail,
+              status: queueStatus,
+              errorMessage: queueError,
+            );
+          }
+
           NotificationService().showExtractionProgress(
             current: _sourceNum,
             total: _totalSources,
             bankName: source.senderName,
           );
 
-          // Small delay to prevent overwhelming the server
           await Future.delayed(const Duration(milliseconds: 50));
+        }
+
+        for (int k = emails.length; k < allEmails.length; k++) {
+          final email = allEmails[k];
+          final uidStr = email.uid?.toString();
+          if (uidStr == null || uidStr.isEmpty) continue;
+          await repo.recordQueuedEmail(
+            emailId: uidStr,
+            subject: email.decodeSubject() ?? 'Statement',
+            emailDate: email.decodeDate() ?? DateTime.now(),
+            sourceId: sourceId,
+          );
+          _queuedForLater++;
         }
       }
 
+      await repo.setAppSetting(StatementBacklog.enqueuedFlagKey, 'true');
+
       // Post-import smart pass: merge per-sender duplicate accounts,
-      // collapse own-account transfers, seed 50/30/20 budgets from income.
+      // match transfers / CC payments, seed 50/30/20 budgets from income.
       setState(() => _currentStatus = 'Organizing your finances…');
       try {
         await repo.mergeDuplicateAccounts();
-        final transfers = await repo.detectInterAccountTransfers();
+        final recon = await ReconciliationService(repo).run();
         final budgets = await repo.autoPopulateBudgets();
-        debugPrint('🤝 Auto-detected $transfers transfers, created $budgets budgets');
+        debugPrint('🤝 $recon, created $budgets budgets');
+        try {
+          await FinancialHealthService(repo).ensureCurrentMonthReport();
+        } catch (e) {
+          debugPrint('Coach after onboarding skipped: $e');
+        }
       } catch (e) {
         debugPrint('⚠️ Post-import pass failed: $e');
       }
@@ -255,7 +317,10 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
         _isComplete = true;
         if (!geminiReady) {
           _currentStatus =
-              'Sources saved — add your Gemini API key in Settings to extract transactions.';
+              'Sources saved — add your AI API key in Settings to extract transactions.';
+        } else if (_queuedForLater > 0) {
+          _currentStatus =
+              'Imported $_importedTransactions transactions from the latest statements. $_queuedForLater older statements from the last ${StatementBacklog.lookbackYears} years are queued — they process in the background, or tap Sync Now.';
         } else if (_failedExtractions > 0) {
           _currentStatus =
               'Done: $_importedTransactions transactions imported · $_failedExtractions statement(s) failed (check PDF passwords in Settings).';
@@ -291,10 +356,10 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
     setState(() {
       _hasError = false;
       _errorMessage = null;
-      _processedStatements = 0;
       _successfulExtractions = 0;
       _failedExtractions = 0;
       _importedTransactions = 0;
+      _queuedForLater = 0;
     });
     _startExtraction();
   }
@@ -350,7 +415,7 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
                         child: Text(
                           _hasError ? (_errorMessage ?? 'Error occurred') : _currentStatus,
                           style: WoText.bodyHi(),
-                          maxLines: 2,
+                          maxLines: 4,
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
@@ -469,7 +534,7 @@ class _ExtractionProgressScreenState extends State<ExtractionProgressScreen> {
         const SizedBox(height: 8),
         Text(
           _isComplete
-              ? '$_importedTransactions transactions imported'
+              ? '$_importedTransactions imported · $_queuedForLater queued for later'
               : 'Bank $_sourceNum of $_totalSources · $_importedTransactions imported so far',
           style: WoText.body(),
         ),

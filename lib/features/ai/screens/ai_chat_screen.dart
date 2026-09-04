@@ -9,11 +9,15 @@ import '../../../data/repositories/app_repository.dart';
 class AiChatScreen extends StatefulWidget {
   final AppRepository repository;
   final GeminiService geminiService;
-  
+  final String? initialContextOverride;
+  final String? initialPrompt;
+
   const AiChatScreen({
     super.key,
     required this.repository,
     required this.geminiService,
+    this.initialContextOverride,
+    this.initialPrompt,
   });
   
   @override
@@ -30,11 +34,22 @@ class _AiChatScreenState extends State<AiChatScreen> {
   @override
   void initState() {
     super.initState();
-    _buildUserContext();
+    _buildUserContext().then((_) {
+      if (widget.initialPrompt != null &&
+          widget.initialPrompt!.trim().isNotEmpty &&
+          mounted) {
+        _sendMessage(widget.initialPrompt!);
+      }
+    });
     _addWelcomeMessage();
   }
   
   Future<void> _buildUserContext() async {
+    if (widget.initialContextOverride != null &&
+        widget.initialContextOverride!.isNotEmpty) {
+      _userContext = widget.initialContextOverride;
+      return;
+    }
     try {
       final netWorth = await widget.repository.getNetWorth();
       final monthlyIncome = await widget.repository.getTotalIncomeByMonth(DateTime.now().year, DateTime.now().month);
@@ -43,16 +58,21 @@ class _AiChatScreenState extends State<AiChatScreen> {
       final assets = await widget.repository.getAllAssets();
       final goals = await widget.repository.getAllGoals();
       final liabilities = await widget.repository.getTotalLiabilities();
+      final coach = await widget.repository.getCoachReport(
+        DateTime.now().year,
+        DateTime.now().month,
+      );
       
       _userContext = '''
-User Financial Summary:
-- Net Worth: AED ${netWorth.toStringAsFixed(0)}
-- Monthly Income: AED ${monthlyIncome.toStringAsFixed(0)}
-- Monthly Expenses: AED ${monthlyExpenses.toStringAsFixed(0)}
+User Financial Summary (base currency aggregates):
+- Net Worth: ${netWorth.toStringAsFixed(0)}
+- Monthly Income: ${monthlyIncome.toStringAsFixed(0)}
+- Monthly Expenses: ${monthlyExpenses.toStringAsFixed(0)}
 - Emergency Fund: $emergencyMonths months
 - Total Assets: ${assets.length}
 - Active Goals: ${goals.where((g) => g.status == 'active').length}
-- Total Liabilities: AED ${liabilities.toStringAsFixed(0)}
+- Total Liabilities: ${liabilities.toStringAsFixed(0)}
+${coach != null ? '- Latest coach score: ${coach.score.round()}/100\n- Coach snapshot: ${coach.snapshotJson}\n' : ''}
 ''';
     } catch (e) {
       _userContext = 'Unable to fetch user data';

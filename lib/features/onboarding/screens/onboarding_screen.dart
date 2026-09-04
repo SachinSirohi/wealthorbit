@@ -8,6 +8,7 @@ import '../../../core/theme/wo_design.dart';
 import '../../../data/services/secure_vault.dart';
 import '../../../data/services/gemini_service.dart';
 import '../../../data/services/imap_service.dart';
+import '../../../data/services/backup_service.dart';
 import 'package:go_router/go_router.dart';
 import 'statement_discovery_screen.dart';
 
@@ -163,6 +164,18 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           }),
           
           const Spacer(),
+
+          TextButton(
+            onPressed: () => BackupService.showImportFlow(context),
+            child: Text(
+              'Restore from another phone',
+              style: GoogleFonts.poppins(
+                color: WoColors.gold,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           
           _buildPrimaryButton('Get Started', () => _nextPage()),
         ],
@@ -297,13 +310,12 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             const SizedBox(height: 16),
 
             Text(
-              'WealthOrbit uses Google Gemini AI to automatically parse your bank statements. You need to provide your own API key (it\'s free!).',
+              'WealthOrbit uses a built-in AI (qwen-14b) to parse bank statements. You can continue with the default key, or paste your own.',
               style: WoText.body(),
             ).animate().fadeIn(delay: 200.ms),
 
             const SizedBox(height: 32),
 
-            // Steps
             Container(
               padding: const EdgeInsets.all(20),
               decoration: woCard(),
@@ -311,18 +323,18 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'How to get your free API key:',
+                    'Built-in AI is ready',
                     style: GoogleFonts.poppins(
                       fontSize: 16,
                       fontWeight: FontWeight.w600,
                       color: WoColors.gold,
                     ),
                   ),
-                  const SizedBox(height: 16),
-                  _buildStep('1', 'Go to aistudio.google.com'),
-                  _buildStep('2', 'Sign in with your Google account'),
-                  _buildStep('3', 'Click "Get API Key" → "Create API Key"'),
-                  _buildStep('4', 'Copy and paste the key below'),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Tap Continue to use the included key. Optional: paste a custom key below and Validate.',
+                    style: WoText.caption(),
+                  ),
                 ],
               ),
             ).animate().fadeIn(delay: 300.ms).slideY(begin: 0.1),
@@ -338,8 +350,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                 color: WoColors.textHi,
               ),
               decoration: woInput(
-                'Gemini API key',
-                hint: 'Paste your Gemini API key here',
+                'AI API key',
+                hint: 'Leave blank to use the built-in key',
                 icon: CupertinoIcons.sparkles,
               ).copyWith(
                 errorText: _keyError,
@@ -372,10 +384,19 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
             _buildPrimaryButton(
               'Continue',
-              _keyValidated ? () async {
-                await SecureVault.setGeminiApiKey(_apiKeyController.text.trim());
+              () async {
+                final typed = _apiKeyController.text.trim();
+                if (typed.isNotEmpty) {
+                  if (!_keyValidated) {
+                    setState(() => _keyError = 'Validate the custom key first, or clear the field to use the built-in key.');
+                    return;
+                  }
+                  await SecureVault.setGeminiApiKey(typed);
+                } else {
+                  await GeminiService.seedDefaultKey();
+                }
                 _nextPage();
-              } : null,
+              },
             ),
 
             const SizedBox(height: 16),
@@ -395,42 +416,6 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildStep(String number, String text) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        children: [
-          Container(
-            width: 28,
-            height: 28,
-            decoration: BoxDecoration(
-              color: WoColors.goldDim,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: WoColors.gold.withValues(alpha: 0.25), width: 0.8),
-            ),
-            child: Center(
-              child: Text(
-                number,
-                style: GoogleFonts.poppins(
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                  color: WoColors.gold,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              text,
-              style: WoText.body(color: WoColors.textHi.withValues(alpha: 0.85)),
-            ),
-          ),
-        ],
       ),
     );
   }

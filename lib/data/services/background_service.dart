@@ -1,6 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'package:workmanager/workmanager.dart';
 import 'package:drift/drift.dart';
+import 'package:enough_mail/enough_mail.dart';
+import '../../core/statement_backlog.dart';
+import '../../core/amount_sanity.dart';
 import '../database/database.dart';
 import '../repositories/app_repository.dart';
 import 'imap_service.dart';
@@ -9,6 +12,8 @@ import 'notification_service.dart';
 import 'secure_vault.dart';
 import 'statement_processor.dart';
 import 'exit_rules_service.dart';
+import 'reconciliation_service.dart';
+import 'financial_health_service.dart';
 
 /// Background Service for automated statement processing and monitoring
 class BackgroundService {
@@ -80,6 +85,19 @@ class BackgroundService {
       taskName,
     );
   }
+
+  /// Drain pending queue on the current isolate (Sync Now / catch-up).
+  ///
+  /// The foreground caller gets a longer deadline than the background worker:
+  /// the user is watching and can see progress, whereas WorkManager will kill
+  /// a job that overruns its execution window.
+  static Future<void> processStatementQueueNow({
+    int maxItems = StatementBacklog.drainBatchSize,
+    Duration deadline = const Duration(minutes: 12),
+    void Function(String status)? onProgress,
+  }) =>
+      _processStatementQueue(
+          maxItems: maxItems, deadline: deadline, onProgress: onProgress);
 }
 
 /// Background task callback dispatcher
@@ -112,9 +130,23 @@ void callbackDispatcher() {
 }
 
 /// Process statement queue using IMAP across ALL connected email accounts.
-Future<void> _processStatementQueue() async {
-  final db = AppDatabase();
-  final repository = AppRepository.withDatabase(db);
+Future<void> _processStatementQueue({
+  int maxItems = StatementBacklog.drainBatchSize,
+  Duration deadline = const Duration(minutes: 8),
+  void Function(String status)? onProgress,
+}) async {
+  // Extraction is slow (a statement window is ~100s against this LLM), so a
+  // full batch can easily outlast the window WorkManager gives a job. Stop
+  // starting new items near the deadline and leave the rest `pending` — the
+  // next run picks up exactly where this one stopped.
+  final startedAt = DateTime.now();
+  bool outOfTime() => DateTime.now().difference(startedAt) >= deadline;
+  final existing = AppRepository.database;
+  final ownsDb = existing == null;
+  final db = existing ?? AppDatabase();
+  final repository = ownsDb
+      ? AppRepository.withDatabase(db)
+      : await AppRepository.getInstance();
   final notificationService = NotificationService();
 
   try {
@@ -124,189 +156,476 @@ Future<void> _processStatementQueue() async {
       return;
     }
 
-    // Gemini must be configured & initialized before we can parse anything.
+    await GeminiService.seedDefaultKey();
     if (!await SecureVault.hasGeminiApiKey()) {
-      debugPrint('🤖 Gemini API key not configured, skipping statement processing');
+      debugPrint('🤖 AI API key not configured, skipping statement processing');
       return;
     }
-    final geminiReady = await GeminiService.initialize();
-    if (!geminiReady) {
-      debugPrint('❌ Could not initialize Gemini AI, skipping statement processing');
+    if (!await GeminiService.initialize()) {
+      debugPrint('❌ Could not initialize AI, skipping statement processing');
       return;
     }
 
+    // Items left in 'processing' after a killed worker block the queue forever.
+    await (db.update(db.statementQueue)
+          ..where((q) => q.status.equals('processing')))
+        .write(StatementQueueCompanion(status: const Value('pending')));
+
+    // Keyed by mailbox: a queue row is fetched from the account it was
+    // discovered in, never from whichever client happens to answer first.
+    final clients = <String, ImapService>{};
     for (final emailAccount in emailAccounts) {
-      final imapService = ImapService(account: emailAccount);
-      final isConnected = await imapService.connect();
-      if (!isConnected) {
-        debugPrint('❌ Could not connect IMAP for ${emailAccount.email}, trying next account');
-        continue;
+      final imap = ImapService(account: emailAccount);
+      if (await imap.connect()) {
+        clients[emailAccount.email.toLowerCase()] = imap;
+      } else {
+        debugPrint('❌ Could not connect IMAP for ${emailAccount.email}');
       }
+    }
+    if (clients.isEmpty) return;
 
-      try {
-        // Get pending items from statement queue
-        final queueItems = await (db.select(db.statementQueue)
-          ..where((q) => q.status.equals('pending'))
-          ..orderBy([(q) => OrderingTerm.asc(q.queuedAt)])
-          ..limit(5)).get();
+    await _enqueueHistoricalBacklog(clients, db, repository, onProgress);
 
-        if (queueItems.isEmpty) {
-          // Discover and add new emails if queue is empty
-          await _fetchNewStatementEmails(imapService, db);
+    int imported = 0;
+    int completed = 0;
+    int emptied = 0;
+    int failed = 0;
+    final reasons = <String, int>{};
+    void noteReason(String r) => reasons[r] = (reasons[r] ?? 0) + 1;
+
+    try {
+      var remaining = maxItems;
+      while (remaining > 0 && !outOfTime()) {
+        var batch = await (db.select(db.statementQueue)
+              ..where((q) => q.status.equals('pending'))
+              ..orderBy([
+                (q) => OrderingTerm.desc(q.emailDate),
+                (q) => OrderingTerm.asc(q.queuedAt),
+              ])
+              ..limit(remaining))
+            .get();
+
+        if (batch.isEmpty) {
+          await _fetchNewStatementEmails(clients, db);
+          batch = await (db.select(db.statementQueue)
+                ..where((q) => q.status.equals('pending'))
+                ..orderBy([
+                  (q) => OrderingTerm.desc(q.emailDate),
+                  (q) => OrderingTerm.asc(q.queuedAt),
+                ])
+                ..limit(remaining))
+              .get();
+          if (batch.isEmpty) break;
         }
 
-        // Re-fetch queue after potential additions
-        final itemsToProcess = await (db.select(db.statementQueue)
-          ..where((q) => q.status.equals('pending'))
-          ..orderBy([(q) => OrderingTerm.asc(q.queuedAt)])
-          ..limit(5)).get();
+        for (final item in batch) {
+          if (outOfTime()) {
+            debugPrint('⏱️ Drain deadline reached — '
+                '${completed + emptied + failed} handled, rest stay queued');
+            remaining = 0;
+            break;
+          }
+          remaining--;
+          onProgress?.call(
+              '${completed + emptied + failed + 1}/$maxItems · ${item.subject}');
+          await Future<void>.delayed(Duration.zero);
 
-        // Process queue items
-        for (final item in itemsToProcess) {
+          if (isNonBankStatementSubject(item.subject)) {
+            await (db.update(db.statementQueue)
+                  ..where((q) => q.id.equals(item.id)))
+                .write(StatementQueueCompanion(
+                  status: const Value('failed'),
+                  errorMessage: const Value('Skipped: not a bank statement'),
+                  processedAt: Value(DateTime.now()),
+                ));
+            failed++;
+            noteReason('not a bank statement');
+            debugPrint('⏭️ Non-bank subject skipped: ${item.subject}');
+            continue;
+          }
+
           try {
             await (db.update(db.statementQueue)
-              ..where((q) => q.id.equals(item.id))).write(
-              StatementQueueCompanion(status: const Value('processing')),
-            );
+                  ..where((q) => q.id.equals(item.id)))
+                .write(StatementQueueCompanion(status: const Value('processing')));
 
-            // Fetch full message by UID (emailId should contain UID)
-            final uid = int.tryParse(item.emailId);
-            final message = uid != null ? await imapService.fetchFullMessage(uid) : null;
+            // Fetch from the OWNING mailbox. Falling back to "any client that
+            // returns something" meant a UID from one account could resolve to
+            // an unrelated email in another.
+            MimeMessage? message;
+            ImapService? owner;
+            if (item.emailId != 'manual_upload') {
+              final uid = int.tryParse(item.emailId);
+              if (uid != null) {
+                final owned = item.accountEmail?.toLowerCase();
+                final candidates = owned != null && clients.containsKey(owned)
+                    ? [clients[owned]!]
+                    // Legacy rows predate mailbox tracking; only then do we
+                    // search every mailbox.
+                    : (owned == null ? clients.values.toList() : const <ImapService>[]);
+                for (final imap in candidates) {
+                  message = await imap.fetchFullMessage(uid);
+                  if (message != null) {
+                    owner = imap;
+                    break;
+                  }
+                }
+              }
+            }
+
             if (message == null) {
-              // Not in this mailbox (or manual item) — leave for another
-              // account/run instead of getting stuck in 'processing'.
+              final retries = item.retryCount + 1;
+              final giveUp = retries >= 2;
               await (db.update(db.statementQueue)
-                ..where((q) => q.id.equals(item.id))).write(
-                StatementQueueCompanion(status: const Value('pending')),
-              );
+                    ..where((q) => q.id.equals(item.id)))
+                  .write(StatementQueueCompanion(
+                    status: Value(giveUp ? 'failed' : 'pending'),
+                    retryCount: Value(retries),
+                    errorMessage: Value(
+                      giveUp
+                          ? 'Email UID ${item.emailId} is no longer in '
+                              '${item.accountEmail ?? 'any connected mailbox'}'
+                          : item.errorMessage,
+                    ),
+                    processedAt: giveUp ? Value(DateTime.now()) : const Value.absent(),
+                  ));
+              if (giveUp) {
+                failed++;
+                noteReason('email no longer in the mailbox');
+                debugPrint('⏭️ Dropped stale queue item ${item.subject} (UID ${item.emailId})');
+              }
               continue;
             }
 
-            // Extract PDF attachments
-            final pdfs = await imapService.extractPdfAttachments(message);
-
-            // Resolve which account these transactions belong to.
-            final source = item.sourceId != null
-                ? await repository.getStatementSource(item.sourceId!)
+            final pdfs = await (owner ?? clients.values.first)
+                .extractPdfAttachments(message);
+            // Rows queued before their sender was mapped carry a null
+            // sourceId. Recover it from the message itself rather than
+            // failing the statement for want of a mapping we can derive.
+            var sourceId = item.sourceId;
+            sourceId ??= await _resolveSourceId(
+                db, message.from?.firstOrNull?.email ?? '');
+            if (sourceId != null && sourceId != item.sourceId) {
+              await (db.update(db.statementQueue)
+                    ..where((q) => q.id.equals(item.id)))
+                  .write(StatementQueueCompanion(sourceId: Value(sourceId)));
+            }
+            final source = sourceId != null
+                ? await repository.getStatementSource(sourceId)
                 : null;
-            final accounts = await repository.getAllAccounts();
-            final accountId = source?.accountId ?? accounts.firstOrNull?.id;
 
-            int transactionCount = 0;
-            if (accountId != null) {
-              final processor = StatementProcessor(repository);
-              final password = await SecureVault.getPdfPassword(item.sourceId ?? '');
-              for (final pdf in pdfs) {
-                transactionCount += await processor.processPdf(
-                  bytes: pdf,
-                  accountId: accountId,
-                  pdfPassword: password,
-                  statementId: item.id,
-                );
-              }
-            } else {
-              debugPrint('⚠️ No account available to attach imported transactions');
+            if (pdfs.isEmpty) {
+              await repository.updateStatementQueueStatus(item.id, 'empty',
+                  errorMessage: 'This email had no PDF attachment.');
+              emptied++;
+              noteReason('no PDF attached');
+              continue;
             }
 
-            // Mark as completed
-            await (db.update(db.statementQueue)
-              ..where((q) => q.id.equals(item.id))).write(
-              StatementQueueCompanion(
-                status: const Value('completed'),
-                processedAt: Value(DateTime.now()),
-              ),
-            );
+            // NEVER guess the destination account. Writing an INR statement
+            // into whichever account happened to be first relabelled every
+            // amount with that account's currency and multiplied it by that
+            // account's FX rate.
+            final accountId = await _resolveAccountId(repository, source);
+            if (accountId == null) {
+              await repository.updateStatementQueueStatus(item.id, 'failed',
+                  errorMessage:
+                      'No account mapped for ${source?.bankName ?? source?.senderEmail ?? 'this sender'}. '
+                      'Map it to an account, then retry.');
+              failed++;
+              noteReason('sender not mapped to an account');
+              continue;
+            }
 
-            await notificationService.showStatementProcessed(
-              bankName: item.sourceId ?? 'Unknown Bank',
-              transactionCount: transactionCount,
+            final processor = StatementProcessor(repository);
+            final password = await SecureVault.resolvePdfPassword(
+              sourceId: sourceId,
+              senderEmail: source?.senderEmail,
+              bankName: source?.bankName,
             );
+            final brokerage = isBrokerageSender(
+                '${source?.bankName ?? ''} ${source?.senderEmail ?? ''} ${item.subject}');
+
+            int transactionCount = 0;
+            String? emptyReason;
+            for (final pdf in pdfs) {
+              final result = brokerage
+                  ? await processor.processBrokeragePdf(
+                      bytes: pdf,
+                      accountId: accountId,
+                      pdfPassword: password,
+                      bankName: source?.bankName,
+                      sourceId: sourceId,
+                      senderEmail: source?.senderEmail,
+                    )
+                  : await processor.processPdf(
+                      bytes: pdf,
+                      accountId: accountId,
+                      pdfPassword: password,
+                      statementId: item.id,
+                      sourceId: sourceId,
+                      senderEmail: source?.senderEmail,
+                    );
+              transactionCount += result.imported;
+              emptyReason ??= result.emptyReason;
+            }
+
+            if (transactionCount == 0) {
+              // "Completed with nothing imported" is not success. Recording
+              // it as `empty` with the reason keeps it visible and retryable
+              // instead of vanishing into the completed pile.
+              await repository.updateStatementQueueStatus(item.id, 'empty',
+                  errorMessage: emptyReason ?? 'No transactions were imported.');
+              emptied++;
+              noteReason(emptyReason ?? 'nothing to import');
+              debugPrint('⚪️ Queue item ${item.subject} → 0 txns · $emptyReason');
+              continue;
+            }
+
+            await (db.update(db.statementQueue)
+                  ..where((q) => q.id.equals(item.id)))
+                .write(StatementQueueCompanion(
+                  status: const Value('completed'),
+                  errorMessage: const Value(null),
+                  processedAt: Value(DateTime.now()),
+                ));
+            imported += transactionCount;
+            completed++;
+            debugPrint(
+                '✅ Queue item ${item.subject} → $transactionCount txns (${completed + emptied + failed} this run)');
           } catch (e) {
-            // Update queue status to failed
+            failed++;
+            noteReason(_reasonFromError(e));
             await (db.update(db.statementQueue)
-              ..where((q) => q.id.equals(item.id))).write(
-              StatementQueueCompanion(
-                status: const Value('failed'),
-                errorMessage: Value(e.toString()),
-              ),
-            );
-
-            await notificationService.showStatementError(
-              bankName: item.sourceId ?? 'Unknown Bank',
-              error: e.toString(),
-            );
+                  ..where((q) => q.id.equals(item.id)))
+                .write(StatementQueueCompanion(
+                  status: const Value('failed'),
+                  errorMessage: Value(e.toString()),
+                  processedAt: Value(DateTime.now()),
+                ));
+            debugPrint('❌ Queue item ${item.subject}: $e');
           }
         }
-      } finally {
-        await imapService.disconnect();
+      }
+
+      if (completed + emptied + failed > 0) {
+        try {
+          onProgress?.call('Matching transfers…');
+          final recon = await ReconciliationService(repository).run();
+          debugPrint('🤝 $recon');
+        } catch (e) {
+          debugPrint('Reconciliation after drain failed: $e');
+        }
+        try {
+          final existing =
+              await repository.getCoachReport(DateTime.now().year, DateTime.now().month);
+          final coach =
+              await FinancialHealthService(repository).ensureCurrentMonthReport();
+          if (coach != null && existing == null) {
+            await notificationService.showCoachReportReady(
+              monthLabel: _monthName(coach.month),
+              score: coach.score.round(),
+            );
+          }
+        } catch (e) {
+          debugPrint('Coach after drain failed: $e');
+        }
+        try {
+          String? dominant;
+          if (reasons.isNotEmpty) {
+            final top = reasons.entries
+                .reduce((a, b) => a.value >= b.value ? a : b);
+            dominant = '${top.value} statement(s): ${top.key}. '
+                'Open Statements & Automation to fix.';
+          }
+          await notificationService.showSyncSummary(
+            imported: imported,
+            succeeded: completed,
+            failed: failed,
+            empty: emptied,
+            dominantReason: dominant,
+          );
+        } catch (e) {
+          debugPrint('Notification after queue drain failed: $e');
+        }
+      }
+    } finally {
+      for (final imap in clients.values) {
+        await imap.disconnect();
       }
     }
   } finally {
-    await db.close();
+    if (ownsDb) await db.close();
   }
 }
 
-/// Fetch new statement emails using IMAP and add to queue
-Future<void> _fetchNewStatementEmails(ImapService imapService, AppDatabase db) async {
-  try {
-    // Discover statement senders
-    final sources = await imapService.discoverStatementSenders(daysBack: 730);
-    
-    // Get list of sender emails
-    final senderEmails = sources.map((s) => s.senderEmail).toList();
-    if (senderEmails.isEmpty) {
-      debugPrint('📭 No statement senders discovered');
-      return;
-    }
-    
-    // Search for emails from discovered senders
-    final headers = await imapService.searchStatementEmails(senderEmails, daysBack: 30);
-    
-    // Add to queue
-    for (final header in headers) {
-      final uid = header.uid?.toString() ?? '';
-      if (uid.isEmpty) continue;
-      
-      // Check if already in queue
-      final existing = await (db.select(db.statementQueue)
-        ..where((q) => q.emailId.equals(uid))).getSingleOrNull();
-      
-      if (existing == null) {
-        final fromAddress = header.from?.firstOrNull?.email ?? '';
-        final sourceId = await _resolveSourceId(db, fromAddress);
+/// Short, user-facing reason for a thrown extraction error.
+String _reasonFromError(Object e) {
+  final s = e.toString().toLowerCase();
+  if (s.contains('password')) return 'need a PDF password';
+  if (s.contains('timeout') || s.contains('timed out')) return 'the AI timed out';
+  if (s.contains('socket') || s.contains('connection')) return 'connection problem';
+  return 'could not be read';
+}
 
-        await db.into(db.statementQueue).insert(StatementQueueCompanion.insert(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          emailId: uid,
-          sourceId: Value(sourceId),
-          subject: header.decodeSubject() ?? 'Statement',
-          emailDate: header.decodeDate() ?? DateTime.now(),
-        ));
-        debugPrint('📥 Queued statement from ${_detectBankName(fromAddress)}');
+/// The account a source's transactions belong to.
+///
+/// Returns null rather than defaulting to the first account in the table.
+/// That fallback is what put rupee statements into an AED account, where
+/// every amount was relabelled AED and multiplied by the AED rate.
+Future<String?> _resolveAccountId(
+  AppRepository repository,
+  StatementSource? source,
+) async {
+  if (source == null) return null;
+  if (source.accountId != null) {
+    // Guard against a mapping that points at a deleted account.
+    if (await repository.getAccount(source.accountId!) != null) {
+      return source.accountId;
+    }
+  }
+  // Adopt an existing account with the same institution name before giving up.
+  final accounts = await repository.getAllAccounts();
+  final bank = source.bankName.trim().toLowerCase();
+  if (bank.isNotEmpty && bank != 'unknown bank') {
+    for (final a in accounts) {
+      if (a.name.trim().toLowerCase() == bank) {
+        await repository.updateStatementSource(
+            source.id, StatementSourcesCompanion(accountId: Value(a.id)));
+        return a.id;
       }
     }
+  }
+  return null;
+}
+
+/// One-shot: enqueue every statement email in the 3-year window that is not
+/// already in `statement_queue`. Onboarding does this too; this covers installs
+/// that already had a 2-year backlog before the 3-year queue existed.
+Future<void> _enqueueHistoricalBacklog(
+  Map<String, ImapService> clients,
+  AppDatabase db,
+  AppRepository repository,
+  void Function(String status)? onProgress,
+) async {
+  if (await repository.getAppSetting(StatementBacklog.enqueuedFlagKey) == 'true') {
+    return;
+  }
+  final existingSources = await db.select(db.statementSources).get();
+  if (existingSources.isEmpty) return;
+  onProgress?.call(
+      'Queuing last ${StatementBacklog.lookbackYears} years of statements…');
+  try {
+    for (final entry in clients.entries) {
+      final mailbox = entry.key;
+      final imap = entry.value;
+      await imap.discoverStatementSenders(daysBack: StatementBacklog.lookbackDays);
+      final sources = await db.select(db.statementSources).get();
+      final senders = sources.map((s) => s.senderEmail).where((e) => e.isNotEmpty).toList();
+      if (senders.isEmpty) continue;
+      final headers = await imap.searchStatementEmails(
+        senders,
+        daysBack: StatementBacklog.lookbackDays,
+      );
+      for (final header in headers) {
+        final uid = header.uid?.toString() ?? '';
+        if (uid.isEmpty) continue;
+        final fromAddress = header.from?.firstOrNull?.email ?? '';
+        final sourceId = await _resolveSourceId(db, fromAddress);
+        await repository.recordQueuedEmail(
+          emailId: uid,
+          subject: header.decodeSubject() ?? 'Statement',
+          emailDate: header.decodeDate() ?? DateTime.now(),
+          sourceId: sourceId,
+          accountEmail: mailbox,
+        );
+      }
+    }
+    await repository.setAppSetting(StatementBacklog.enqueuedFlagKey, 'true');
+    debugPrint('📥 Historical 3-year statement backlog queued');
   } catch (e) {
-    debugPrint('Error fetching statement emails: $e');
+    debugPrint('⚠️ Historical backlog enqueue failed: $e');
   }
 }
 
-/// Find an existing StatementSources row for [fromAddress] — or create one,
-/// defaulting its destination account to the first account — and return its id.
-/// This keeps StatementQueue.sourceId a real foreign key (not a bank name).
+/// Fetch new statement emails from EVERY connected mailbox and add them to
+/// the queue. This used to run against `clients.first` only, so statements
+/// arriving in any account other than the first were never picked up.
+Future<void> _fetchNewStatementEmails(
+  Map<String, ImapService> clients,
+  AppDatabase db,
+) async {
+  final repository = AppRepository.withDatabase(db);
+  for (final entry in clients.entries) {
+    final mailbox = entry.key;
+    final imapService = entry.value;
+    try {
+      final sources = await imapService.discoverStatementSenders(
+        daysBack: StatementBacklog.incrementalFetchDays,
+      );
+
+      // Get list of sender emails
+      final senderEmails = sources.map((s) => s.senderEmail).toList();
+      if (senderEmails.isEmpty) {
+        debugPrint('📭 No statement senders discovered in $mailbox');
+        continue;
+      }
+
+      final headers = await imapService.searchStatementEmails(
+        senderEmails,
+        daysBack: StatementBacklog.incrementalFetchDays,
+      );
+
+      for (final header in headers) {
+        final uid = header.uid?.toString() ?? '';
+        if (uid.isEmpty) continue;
+        final fromAddress = header.from?.firstOrNull?.email ?? '';
+        final sourceId = await _resolveSourceId(db, fromAddress);
+        await repository.recordQueuedEmail(
+          emailId: uid,
+          subject: header.decodeSubject() ?? 'Statement',
+          emailDate: header.decodeDate() ?? DateTime.now(),
+          sourceId: sourceId,
+          accountEmail: mailbox,
+        );
+      }
+    } catch (e) {
+      debugPrint('Error fetching statement emails from $mailbox: $e');
+    }
+  }
+}
+
+/// Find an existing StatementSources row for [fromAddress], or create one,
+/// and return its id. This keeps StatementQueue.sourceId a real foreign key
+/// (not a bank name).
+///
+/// A newly minted source is left UNMAPPED unless an account with the same
+/// institution name already exists. It used to default to `accounts.first`,
+/// which silently routed every unrecognised bank's statements into one
+/// account and relabelled their amounts with that account's currency.
 Future<String?> _resolveSourceId(AppDatabase db, String fromAddress) async {
   if (fromAddress.isEmpty) return null;
   final existing = await (db.select(db.statementSources)
     ..where((s) => s.senderEmail.equals(fromAddress))).getSingleOrNull();
   if (existing != null) return existing.id;
 
+  final bankName = _detectBankName(fromAddress);
   final accounts = await db.select(db.accounts).get();
-  final id = DateTime.now().millisecondsSinceEpoch.toString();
+  String? matchedAccountId;
+  for (final a in accounts) {
+    if (a.name.trim().toLowerCase() == bankName.trim().toLowerCase()) {
+      matchedAccountId = a.id;
+      break;
+    }
+  }
+
+  final id = 'src_${DateTime.now().millisecondsSinceEpoch}';
   await db.into(db.statementSources).insert(StatementSourcesCompanion.insert(
     id: id,
     senderEmail: fromAddress,
-    bankName: _detectBankName(fromAddress),
-    accountType: 'bank',
-    accountId: Value(accounts.firstOrNull?.id),
+    bankName: bankName,
+    accountType: isBrokerageSender('$bankName $fromAddress') ? 'brokerage' : 'bank',
+    accountId: Value(matchedAccountId),
   ));
   return id;
 }
@@ -359,9 +678,36 @@ Future<void> _checkBudgetAlerts() async {
         percentUsed: (alert['percentUsed'] as double).round(),
       );
     }
+
+    // Monthly coach: generate once when this month has no report yet.
+    final now = DateTime.now();
+    final existing = await repository.getCoachReport(now.year, now.month);
+    if (existing == null) {
+      try {
+        final coach =
+            await FinancialHealthService(repository).ensureCurrentMonthReport();
+        if (coach != null) {
+          await notificationService.showCoachReportReady(
+            monthLabel: _monthName(coach.month),
+            score: coach.score.round(),
+          );
+        }
+      } catch (e) {
+        debugPrint('Monthly coach generation failed: $e');
+      }
+    }
   } finally {
     await db.close();
   }
+}
+
+String _monthName(int month) {
+  const names = [
+    '', 'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  if (month < 1 || month > 12) return 'This month';
+  return names[month];
 }
 
 /// Check SIP reminders

@@ -99,3 +99,7 @@ docs/
 *.md
 !README.md
 .github/
+
+# Build-time secrets (LLM API key) — never commit.
+# dart_defines.example.json is the committed template and must stay tracked.
+/dart_defines.json

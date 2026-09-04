@@ -55,9 +55,21 @@ class CurrencyUtils {
   }
 
   /// Heuristic: does this bank/sender text refer to a CREDIT CARD product?
+  /// True when this sender/subject is specifically a CREDIT CARD statement.
+  ///
+  /// The old test was `contains('card') || contains('credit')`, which is
+  /// satisfied by almost anything — including a savings-account sender at a
+  /// bank that also issues cards. Because callers used the result to retype
+  /// a whole account as `credit_card` (and re-sign its balance as debt), one
+  /// loose match turned a savings account into millions of "debt". Match on
+  /// real card vocabulary at word boundaries instead.
   static bool isCreditCardHint(String text) {
     final s = text.toLowerCase();
-    return s.contains('card') || s.contains('credit');
+    return RegExp(
+      r'\bcredit\s*card\b|\bcard\s*statement\b|\bcc\s*statement\b|'
+      r'\bcardstatement\b|\bcreditcard\b|\bcard\s*services\b|'
+      r'\bamex\b|\bamerican\s*express\b',
+    ).hasMatch(s);
   }
 
   static String symbolFor(String code) => symbols[code] ?? '$code ';

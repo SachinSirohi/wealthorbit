@@ -68,6 +68,64 @@ class SecureVault {
     return await _storage.read(key: 'pdf_pwd_$sourceId');
   }
 
+  /// Resolve a statement PDF password across every key space the app has
+  /// ever written to.
+  ///
+  /// Onboarding stores passwords keyed by SENDER EMAIL, the settings screen
+  /// and the extraction screen key them by SOURCE ID, and sources minted by
+  /// the background worker have neither. Reading only one of those keys is
+  /// why password-protected statements failed with `The password is
+  /// invalid.: ""` — the lookup missed, and the PDF was opened with no
+  /// password at all. Always resolve through here.
+  static Future<String?> resolvePdfPassword({
+    String? sourceId,
+    String? senderEmail,
+    String? bankName,
+  }) async {
+    for (final key in [sourceId, senderEmail, senderEmail?.toLowerCase(), bankName]) {
+      if (key == null || key.isEmpty) continue;
+      final pwd = await getPdfPassword(key);
+      if (pwd != null && pwd.isNotEmpty) return pwd;
+    }
+    return null;
+  }
+
+  /// Every distinct PDF password the user has already saved, newest-looking
+  /// first is not knowable — order is arbitrary.
+  ///
+  /// Most people protect every statement with one or two secrets (a PAN, a
+  /// date of birth). Once one source is unlocked, the others usually open
+  /// with the same string, so extraction tries these before giving up and
+  /// asking. Saves the user typing the same PAN into six brokers.
+  static Future<List<String>> getKnownPdfPasswords() async {
+    try {
+      final all = await _storage.readAll();
+      final out = <String>{};
+      for (final entry in all.entries) {
+        if (!entry.key.startsWith('pdf_pwd_')) continue;
+        final v = entry.value.trim();
+        if (v.isNotEmpty) out.add(v);
+      }
+      return out.toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Write a password under every key the readers may look under, so a
+  /// password captured in one flow is found by all the others.
+  static Future<void> setPdfPasswordForSource({
+    String? sourceId,
+    String? senderEmail,
+    required String password,
+  }) async {
+    if (password.isEmpty) return;
+    for (final key in {sourceId, senderEmail, senderEmail?.toLowerCase()}) {
+      if (key == null || key.isEmpty) continue;
+      await setPdfPassword(key, password);
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // USER PREFERENCES
   // ═══════════════════════════════════════════════════════════════════════════
@@ -197,6 +255,20 @@ class SecureVault {
   // UTILITIES
   // ═══════════════════════════════════════════════════════════════════════════
   
+  /// Snapshot of every vault entry (API key, IMAP accounts, PDF passwords).
+  static Future<Map<String, String>> exportAll() async {
+    return await _storage.readAll();
+  }
+
+  /// Replace the vault with a backup snapshot.
+  static Future<void> restoreAll(Map<String, String> data) async {
+    await _storage.deleteAll();
+    for (final entry in data.entries) {
+      if (entry.key.isEmpty) continue;
+      await _storage.write(key: entry.key, value: entry.value);
+    }
+  }
+
   /// Clear all stored data (for logout/reset)
   static Future<void> clearAll() async {
     await _storage.deleteAll();

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
@@ -74,7 +75,7 @@ class _InvestmentsScreenState extends State<InvestmentsScreen> with SingleTicker
 
       final stocks = allAssets.where((a) => a.type == 'stocks').toList();
       final mfs = allAssets.where((a) => a.type == 'mutual_funds').toList();
-      final fds = allAssets.where((a) => a.type == 'fixed_deposit').toList();
+      final fds = allAssets.where((a) => a.type == 'fixed_deposit' || a.type == 'bonds').toList();
       final retirement = allAssets.where((a) => ['ppf', 'nps', 'epf'].contains(a.type)).toList();
 
       // Holdings may be in INR/AED/USD/etc. → convert each into the base
@@ -389,7 +390,8 @@ class _InvestmentsScreenState extends State<InvestmentsScreen> with SingleTicker
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(investment.name, style: WoText.subtitle(), maxLines: 1, overflow: TextOverflow.ellipsis),
-                Text(investment.geography, style: WoText.caption(color: WoColors.textLo)),
+                Text(_holdingDetail(investment), style: WoText.caption(color: WoColors.textLo),
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
@@ -409,6 +411,32 @@ class _InvestmentsScreenState extends State<InvestmentsScreen> with SingleTicker
         ],
       ),
     );
+  }
+
+  /// One-line detail for a holding. Statement-imported holdings carry units,
+  /// price/NAV, ISIN and the statement date in `metadata`; manual entries
+  /// fall back to the geography label.
+  String _holdingDetail(Asset a) {
+    if (a.metadata == null || a.metadata!.isEmpty) return a.geography;
+    try {
+      final m = json.decode(a.metadata!) as Map<String, dynamic>;
+      final parts = <String>[];
+      final qty = (m['quantity'] as num?)?.toDouble();
+      final price = (m['price'] as num?)?.toDouble();
+      if (qty != null) {
+        final q = qty == qty.roundToDouble() ? qty.toInt().toString() : qty.toStringAsFixed(3);
+        parts.add(price != null
+            ? '$q × ${CurrencyUtils.format(price, a.currencyCode, decimals: 2)}'
+            : '$q units');
+      }
+      final source = m['source']?.toString();
+      if (source != null && source.isNotEmpty) parts.add(source);
+      final asOf = m['asOf']?.toString();
+      if (asOf != null && asOf.isNotEmpty && asOf != 'null') parts.add('as of $asOf');
+      return parts.isEmpty ? a.geography : parts.join(' · ');
+    } catch (_) {
+      return a.geography;
+    }
   }
 
   void _showAddInvestmentSheet() {

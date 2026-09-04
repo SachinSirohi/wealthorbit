@@ -133,9 +133,46 @@ class NotificationService {
     required int transactionCount,
   }) async {
     await _showNotification(
-      id: DateTime.now().millisecondsSinceEpoch,
+      id: _safeId('stmt_ok_${bankName}_${DateTime.now().millisecondsSinceEpoch}'),
       title: '✅ Statement Processed',
       body: '$bankName: $transactionCount transactions imported successfully.',
+      channel: 'statement_processing',
+      channelName: 'Statement Processing',
+    );
+  }
+
+  /// Result of one queue drain. Never claims success when nothing was
+  /// imported — a run that only produced failures says so, and names the
+  /// dominant reason so the notification is actionable on its own.
+  Future<void> showSyncSummary({
+    required int imported,
+    required int succeeded,
+    required int failed,
+    required int empty,
+    String? dominantReason,
+  }) async {
+    if (imported > 0) {
+      final trailer = failed + empty > 0
+          ? ' ${failed + empty} statement(s) still need attention.'
+          : '';
+      await _showNotification(
+        id: _safeId('stmt_ok_${DateTime.now().millisecondsSinceEpoch}'),
+        title: '✅ $imported transactions imported',
+        body: 'From $succeeded statement(s).$trailer',
+        channel: 'statement_processing',
+        channelName: 'Statement Processing',
+      );
+      return;
+    }
+
+    if (failed + empty == 0) return; // nothing attempted — stay quiet
+
+    await _showNotification(
+      id: _safeId('stmt_fail_${DateTime.now().millisecondsSinceEpoch}'),
+      title: '⚠️ No transactions imported',
+      body: dominantReason ??
+          '${failed + empty} statement(s) could not be read. '
+              'Open Statements & Automation to fix.',
       channel: 'statement_processing',
       channelName: 'Statement Processing',
     );
@@ -146,11 +183,24 @@ class NotificationService {
     required String error,
   }) async {
     await _showNotification(
-      id: DateTime.now().millisecondsSinceEpoch,
+      id: _safeId('stmt_err_${bankName}_${DateTime.now().millisecondsSinceEpoch}'),
       title: '❌ Statement Error',
       body: 'Failed to process $bankName statement: $error',
       channel: 'statement_processing',
       channelName: 'Statement Processing',
+    );
+  }
+
+  Future<void> showCoachReportReady({
+    required String monthLabel,
+    required int score,
+  }) async {
+    await _showNotification(
+      id: _safeId('coach_$monthLabel'),
+      title: 'Your $monthLabel financial health wrap is ready',
+      body: 'Score $score/100 — tap WealthOrbit to read your coach briefing.',
+      channel: 'financial_coach',
+      channelName: 'Financial Health Coach',
     );
   }
   
@@ -162,7 +212,7 @@ class NotificationService {
     required String description,
   }) async {
     await _showNotification(
-      id: DateTime.now().millisecondsSinceEpoch,
+      id: _safeId('anomaly_${DateTime.now().millisecondsSinceEpoch}'),
       title: '🔍 Unusual Activity Detected',
       body: description,
       channel: 'anomaly_detection',
@@ -282,7 +332,15 @@ class NotificationService {
       iOS: iosDetails,
     );
     
-    await _notifications.show(id, title, body, details);
+    await _notifications.show(_safeId(id), title, body, details);
+  }
+
+  /// Android notification ids are 32-bit. Epoch millis (~1.7e12) overflow
+  /// and crash the background isolate, aborting statement import.
+  static int _safeId(Object seed) {
+    final raw = seed is int ? seed : seed.hashCode;
+    final id = raw & 0x7fffffff;
+    return id == 0 ? 1 : id;
   }
   
   /// Cancel all notifications

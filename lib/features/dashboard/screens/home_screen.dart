@@ -6,6 +6,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:go_router/go_router.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'dart:convert';
 import '../../../core/theme/wo_design.dart';
 import '../../../core/utils/currency_utils.dart';
 import '../../../data/database/database.dart';
@@ -47,6 +48,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<NetWorthSnapshot> _netWorthTrend = [];
   List<_Obligation> _obligations = [];
   List<FinancialInsight> _insights = [];
+  CoachReport? _coachReport;
   
   @override
   void initState() {
@@ -129,9 +131,12 @@ class _HomeScreenState extends State<HomeScreen> {
         insights = await _repo!.getActiveInsights();
       } catch (_) {}
 
+      final coach = await _repo!.getCoachReport(now.year, now.month);
+
       if (!mounted) return;
       setState(() {
         _insights = insights;
+        _coachReport = coach;
         _netWorth = netWorth;
         _totalAssets = totalAssets;
         _totalAccounts = totalAccounts;
@@ -172,6 +177,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Center(child: CircularProgressIndicator(color: WoColors.gold)),
               )
             else ...[
+              _buildCoachCard(),
               _buildInsights(),
               _buildNetWorthCard(),
               _buildQuickActions(),
@@ -408,6 +414,71 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildCoachCard() {
+    final report = _coachReport;
+    String headline = 'Tap to generate this month\'s financial health wrap';
+    if (report != null) {
+      try {
+        final decoded = json.decode(report.reportJson);
+        final narrative = decoded is Map ? decoded['headline']?.toString() : null;
+        headline = narrative ?? 'Score ${report.score.round()}/100 — open your coach wrap';
+      } catch (_) {
+        headline = 'Score ${report.score.round()}/100 — open your coach wrap';
+      }
+    }
+
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+        child: InkWell(
+          onTap: () => context.push('/coach'),
+          borderRadius: BorderRadius.circular(WoRadius.card),
+          child: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: woCard(goldGlow: true),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 52,
+                  height: 52,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      CircularProgressIndicator(
+                        value: report == null
+                            ? null
+                            : (report.score / 100).clamp(0.0, 1.0),
+                        strokeWidth: 5,
+                        backgroundColor: WoColors.borderHi,
+                        color: WoColors.gold,
+                      ),
+                      Text(
+                        report == null ? '—' : '${report.score.round()}',
+                        style: WoText.num(size: 14),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('THIS MONTH\'S COACH', style: WoText.label()),
+                      const SizedBox(height: 4),
+                      Text(headline, style: WoText.bodyHi(), maxLines: 2, overflow: TextOverflow.ellipsis),
+                    ],
+                  ),
+                ),
+                Icon(CupertinoIcons.chevron_right, color: WoColors.textLo, size: 18),
+              ],
+            ),
+          ),
+        ),
+      ).animate().fadeIn(),
     );
   }
 

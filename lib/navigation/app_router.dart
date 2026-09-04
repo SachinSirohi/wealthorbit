@@ -12,6 +12,7 @@ import '../features/reports/screens/reports_screen.dart';
 import '../features/transactions/screens/transactions_screen.dart';
 import '../features/accounts/screens/accounts_screen.dart';
 import '../features/assets/screens/assets_screen.dart';
+import '../features/coach/screens/financial_coach_screen.dart';
 import 'main_shell.dart';
 
 /// App route definitions
@@ -28,6 +29,7 @@ class AppRoutes {
   static const String transactions = '/transactions';
   static const String accounts = '/accounts';
   static const String assets = '/assets';
+  static const String coach = '/coach';
   
   // Sub-routes
   static const String propertyDetail = '/real-estate/:id';
@@ -134,6 +136,13 @@ class AppRouter {
             pageBuilder: (context, state) => _buildPageWithAnimation(
               state,
               const StatementAutomationScreen(),
+            ),
+          ),
+          GoRoute(
+            path: AppRoutes.coach,
+            pageBuilder: (context, state) => _buildPageWithAnimation(
+              state,
+              const FinancialCoachScreen(),
             ),
           ),
         ],

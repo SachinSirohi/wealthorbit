@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import '../../../core/theme/wo_design.dart';
+import '../../../core/statement_backlog.dart';
 import '../../../data/models/discovered_source.dart';
 import '../../../data/services/imap_service.dart';
 import 'password_collection_screen.dart';
@@ -44,9 +45,12 @@ class _StatementDiscoveryScreenState extends State<StatementDiscoveryScreen> {
         return;
       }
 
-      setState(() => _statusMessage = 'Scanning your inbox for statements...');
+      setState(() => _statusMessage =
+          'Scanning the last ${StatementBacklog.lookbackYears} years of statements...');
 
-      final sources = await _imapService.discoverStatementSenders(daysBack: 730);
+      final sources = await _imapService.discoverStatementSenders(
+        daysBack: StatementBacklog.lookbackDays,
+      );
 
       await _imapService.disconnect();
 
@@ -117,7 +121,7 @@ class _StatementDiscoveryScreenState extends State<StatementDiscoveryScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            'This may take a minute...',
+            'This can take a couple of minutes for three years of mail...',
             style: WoText.body(),
           ),
         ],
@@ -190,7 +194,7 @@ class _StatementDiscoveryScreenState extends State<StatementDiscoveryScreen> {
               ),
               const SizedBox(height: 16),
               Text(
-                'Select the accounts you want to import:',
+                'The newest statements import now so the dashboard is ready. Older mail from the last ${StatementBacklog.lookbackYears} years is queued and processed in the background (or tap Sync Now).',
                 style: WoText.body(),
               ),
             ],

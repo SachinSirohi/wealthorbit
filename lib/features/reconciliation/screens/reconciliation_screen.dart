@@ -5,9 +5,10 @@ import 'package:intl/intl.dart';
 import '../../../core/theme/wo_design.dart';
 import '../../../data/database/database.dart';
 import '../../../data/repositories/app_repository.dart';
+import '../../../data/services/reconciliation_service.dart';
 
-/// Bank reconciliation: review auto-imported ("pending") transactions and
-/// confirm them, or match them to a manually-entered duplicate.
+/// Bank reconciliation: review pending imports, suggested transfers, and
+/// same-account duplicates.
 class ReconciliationScreen extends StatefulWidget {
   const ReconciliationScreen({super.key});
 
@@ -17,9 +18,15 @@ class ReconciliationScreen extends StatefulWidget {
 
 class _ReconciliationScreenState extends State<ReconciliationScreen> {
   AppRepository? _repo;
+  ReconciliationService? _recon;
   bool _isLoading = true;
   List<Account> _accounts = [];
   final Map<String, List<Transaction>> _pendingByAccount = {};
+  List<_SuggestedTransferVm> _suggestions = [];
+  Map<String, Account> _accountById = {};
+  // Per-account: what the bank's last statement said vs what the ledger
+  // could explain. The pipeline used to anchor silently; now the gap shows.
+  final List<_AnchorVm> _anchors = [];
 
   @override
   void initState() {
@@ -29,6 +36,7 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
 
   Future<void> _init() async {
     _repo = await AppRepository.getInstance();
+    _recon = ReconciliationService(_repo!);
     await _load();
   }
 
@@ -36,20 +44,57 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
     if (!mounted) return;
     setState(() => _isLoading = true);
     final accounts = await _repo!.getAllAccounts();
+    _accountById = {for (final a in accounts) a.id: a};
     _pendingByAccount.clear();
     for (final a in accounts) {
       final pending = await _repo!.getPendingTransactions(a.id);
       if (pending.isNotEmpty) _pendingByAccount[a.id] = pending;
     }
+
+    _anchors.clear();
+    for (final a in accounts) {
+      final info = await _repo!.getAnchorInfo(a.id);
+      if (info != null) _anchors.add(_AnchorVm(account: a, closing: info.closing, date: info.date, drift: info.drift));
+    }
+    _anchors.sort((x, y) => y.drift.abs().compareTo(x.drift.abs()));
+
+    final pendingSuggestions = await _repo!.getPendingSuggestedMatches();
+    final vms = <_SuggestedTransferVm>[];
+    for (final s in pendingSuggestions) {
+      final from = await _repo!.getTransactionById(s.fromTxnId);
+      final to = await _repo!.getTransactionById(s.toTxnId);
+      if (from == null || to == null) continue;
+      vms.add(_SuggestedTransferVm(suggestion: s, from: from, to: to));
+    }
+
     if (!mounted) return;
     setState(() {
       _accounts = accounts.where((a) => _pendingByAccount.containsKey(a.id)).toList();
+      _suggestions = vms;
       _isLoading = false;
     });
   }
 
   Future<void> _clear(Transaction tx) async {
     await _repo!.markTransactionCleared(tx.id);
+    await _load();
+  }
+
+  Future<void> _acceptSuggestion(_SuggestedTransferVm vm) async {
+    final ok = await _recon!.acceptSuggestion(vm.suggestion.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(ok
+          ? (vm.suggestion.kind == 'duplicate_spend'
+              ? 'Marked as a duplicate — excluded from totals'
+              : 'Transfer applied')
+          : 'Could not apply this match'),
+    ));
+    await _load();
+  }
+
+  Future<void> _rejectSuggestion(_SuggestedTransferVm vm) async {
+    await _recon!.rejectSuggestion(vm.suggestion.id);
     await _load();
   }
 
@@ -99,6 +144,7 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final empty = _accounts.isEmpty && _suggestions.isEmpty && _anchors.isEmpty;
     return Scaffold(
       backgroundColor: WoColors.bg,
       appBar: AppBar(
@@ -108,11 +154,39 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
       ),
       body: _isLoading
           ? Center(child: CircularProgressIndicator(color: WoColors.gold))
-          : _accounts.isEmpty
+          : empty
               ? _emptyState()
               : ListView(
                   padding: const EdgeInsets.all(16),
-                  children: _accounts.map(_buildAccountSection).toList(),
+                  children: [
+                    if (_anchors.isNotEmpty) ...[
+                      WoSectionHeader(
+                        'Statement check',
+                        padding: const EdgeInsets.fromLTRB(2, 4, 2, 10),
+                      ),
+                      Text(
+                        'What each bank last reported, and how much of it the ledger could not explain.',
+                        style: WoText.caption(),
+                      ),
+                      const SizedBox(height: 12),
+                      ..._anchors.map(_buildAnchorTile),
+                      const SizedBox(height: 16),
+                    ],
+                    if (_suggestions.isNotEmpty) ...[
+                      WoSectionHeader(
+                        'Suggested transfers',
+                        padding: const EdgeInsets.fromLTRB(2, 4, 2, 10),
+                      ),
+                      Text(
+                        'High-confidence matches auto-apply. Review these and Accept or Reject.',
+                        style: WoText.caption(),
+                      ),
+                      const SizedBox(height: 12),
+                      ..._suggestions.map(_buildSuggestionTile),
+                      const SizedBox(height: 16),
+                    ],
+                    ..._accounts.map(_buildAccountSection),
+                  ],
                 ),
     );
   }
@@ -120,8 +194,113 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
   Widget _emptyState() => const WoEmptyState(
         icon: CupertinoIcons.checkmark_seal_fill,
         title: 'Everything reconciled',
-        hint: 'No pending imported transactions to review',
+        hint: 'No pending imports or suggested transfers to review',
       );
+
+  Widget _buildAnchorTile(_AnchorVm vm) {
+    final explained = vm.drift.abs() < 1;
+    final color = explained ? WoColors.mint : WoColors.red;
+    final when = vm.date != null ? DateFormat('MMM d').format(vm.date!) : 'latest';
+    final fmt = NumberFormat.currency(symbol: '${vm.account.currencyCode} ', decimalDigits: 0);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: woCard(radius: 18),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(vm.account.name, style: WoText.subtitle()),
+                const SizedBox(height: 2),
+                Text('Bank statement ($when): ${fmt.format(vm.closing)}', style: WoText.caption()),
+              ],
+            ),
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                explained ? 'Fully explained' : '${fmt.format(vm.drift.abs())} unexplained',
+                style: WoText.caption(color: color),
+              ),
+              if (!explained)
+                Text(
+                  vm.drift > 0 ? 'ledger was short' : 'ledger was over',
+                  style: WoText.caption(color: WoColors.textLo),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSuggestionTile(_SuggestedTransferVm vm) {
+    final fromAcc = _accountById[vm.from.accountId];
+    final toAcc = _accountById[vm.to.accountId];
+    final kindLabel = switch (vm.suggestion.kind) {
+      'cc_payment' => 'Credit card payment',
+      'duplicate_spend' => 'Duplicate spend',
+      _ => 'Own-account transfer',
+    };
+    final pct = (vm.suggestion.confidence * 100).round();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: woCard(radius: 18, tint: WoColors.gold),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(child: Text(kindLabel, style: WoText.subtitle())),
+              WoChip('$pct%', color: WoColors.gold),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${fromAcc?.name ?? 'Account'} → ${toAcc?.name ?? 'Account'}',
+            style: WoText.bodyHi(),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${vm.from.currencyCode} ${vm.from.amountSource.toStringAsFixed(2)}'
+            ' · base ${vm.from.amountBase.toStringAsFixed(0)}'
+            ' · ${DateFormat.MMMd().format(vm.from.transactionDate)}',
+            style: WoText.caption(),
+          ),
+          if (vm.suggestion.reason != null && vm.suggestion.reason!.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(vm.suggestion.reason!, style: WoText.caption(color: WoColors.textMid)),
+          ],
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () => _rejectSuggestion(vm),
+                  style: WoButtons.ghost,
+                  child: const Text('Reject'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: () => _acceptSuggestion(vm),
+                  style: WoButtons.primary,
+                  child: Text(vm.suggestion.kind == 'duplicate_spend'
+                      ? 'Mark duplicate'
+                      : 'Accept'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildAccountSection(Account account) {
     final pending = _pendingByAccount[account.id]!;
@@ -186,4 +365,24 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
       ),
     );
   }
+}
+
+class _SuggestedTransferVm {
+  final SuggestedMatche suggestion;
+  final Transaction from;
+  final Transaction to;
+  _SuggestedTransferVm({
+    required this.suggestion,
+    required this.from,
+    required this.to,
+  });
+}
+
+
+class _AnchorVm {
+  final Account account;
+  final double closing;
+  final DateTime? date;
+  final double drift;
+  _AnchorVm({required this.account, required this.closing, required this.date, required this.drift});
 }
