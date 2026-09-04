@@ -13,6 +13,7 @@ import 'data/services/gemini_service.dart';
 import 'data/repositories/app_repository.dart';
 import 'data/services/fx_service.dart';
 import 'data/services/demo_data_service.dart';
+import 'data/services/diagnostics_service.dart';
 import 'features/security/screens/app_lock_screen.dart';
 import 'navigation/app_router.dart';
 
@@ -191,6 +192,18 @@ void main() async {
     // seeds a fully fictional dataset for screenshots.
     if (const bool.fromEnvironment('DEMO')) {
       await DemoDataService.seed(repo);
+    }
+
+    // Leave a health report behind on every launch. The release build cannot
+    // be inspected with `run-as`, and a periodic WorkManager job refuses to
+    // be forced early, so an ordinary app open is the reliable way to make
+    // the ledger's state readable over ADB:
+    //   adb shell cat /sdcard/Android/data/<pkg>/files/wo_diagnostics.json
+    try {
+      final db = AppRepository.database;
+      if (db != null) await DiagnosticsService.dump(db, repo);
+    } catch (e) {
+      debugPrint('Diagnostics dump skipped: $e');
     }
 
     // Ensure FX rates are populated, repair any pre-multi-currency data once,

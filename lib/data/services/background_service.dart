@@ -14,6 +14,7 @@ import 'statement_processor.dart';
 import 'exit_rules_service.dart';
 import 'reconciliation_service.dart';
 import 'financial_health_service.dart';
+import 'diagnostics_service.dart';
 
 /// Background Service for automated statement processing and monitoring
 class BackgroundService {
@@ -104,6 +105,15 @@ class BackgroundService {
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
+    // Every background run leaves a health report behind. The release build
+    // cannot be inspected with `run-as`, and driving the UI is not always
+    // possible, so this is how the ledger's state can be reviewed over ADB.
+    try {
+      final db = AppRepository.database ?? AppDatabase();
+      await DiagnosticsService.dump(db, AppRepository.withDatabase(db));
+    } catch (e) {
+      debugPrint('Diagnostics dump skipped: $e');
+    }
     try {
       switch (task) {
         case BackgroundService.statementProcessingTask:
@@ -170,6 +180,11 @@ Future<void> _processStatementQueue({
     await (db.update(db.statementQueue)
           ..where((q) => q.status.equals('processing')))
         .write(StatementQueueCompanion(status: const Value('pending')));
+
+    // Give transient failures (timeouts, dropped connections) another go on
+    // an exponential backoff, so one bad night of connectivity does not
+    // leave a permanent hole waiting for someone to notice and tap Retry.
+    await repository.requeueRetryableFailures();
 
     // Keyed by mailbox: a queue row is fetched from the account it was
     // discovered in, never from whichever client happens to answer first.

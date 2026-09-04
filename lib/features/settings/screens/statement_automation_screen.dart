@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -10,6 +11,7 @@ import '../../../core/statement_backlog.dart';
 import '../../../core/amount_sanity.dart';
 import '../../../data/database/database.dart';
 import '../../../data/repositories/app_repository.dart';
+import '../../../navigation/app_router.dart';
 import '../../../data/services/secure_vault.dart';
 import '../../../data/services/imap_service.dart';
 import '../../../data/services/statement_processor.dart';
@@ -243,6 +245,12 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
             Expanded(child: WoSectionHeader('Processing Queue', padding: EdgeInsets.zero)),
             if (_queue.isNotEmpty)
               WoChip('${_queue.length} Pending', color: WoColors.gold),
+            TextButton.icon(
+              onPressed: () => context.push(AppRoutes.dataHealth),
+              icon: Icon(CupertinoIcons.chart_bar_alt_fill, color: WoColors.gold, size: 16),
+              label: Text('Data health',
+                  style: GoogleFonts.inter(color: WoColors.gold, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            ),
             TextButton.icon(
               onPressed: _uploadManualStatement,
               icon: Icon(Icons.upload_file, color: WoColors.gold, size: 16),

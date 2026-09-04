@@ -252,13 +252,20 @@ class FinancialHealthService {
     return saved!;
   }
 
-  /// Generate this month's report if missing (background / Sync Now).
+  /// Generate this month's report if missing, or if the month's data has
+  /// moved on materially since the existing one was written.
   Future<CoachReport?> ensureCurrentMonthReport() async {
     final now = DateTime.now();
     final existing = await repository.getCoachReport(now.year, now.month);
-    if (existing != null) return existing;
+    if (existing != null && !await _isReportStale(existing, now)) {
+      return existing;
+    }
     try {
-      return await generateReport(year: now.year, month: now.month);
+      return await generateReport(
+        year: now.year,
+        month: now.month,
+        force: existing != null,
+      );
     } on InsufficientDataException catch (e) {
       // Not an error: there genuinely is not enough imported data to score
       // this month. No report, no notification, no invented 90/100.
@@ -267,6 +274,34 @@ class FinancialHealthService {
     } catch (e) {
       debugPrint('Coach ensure failed: $e');
       return null;
+    }
+  }
+
+  /// True when the month's transaction count has moved far enough from the
+  /// count the report was written against for its narrative to be stale.
+  ///
+  /// A report is only as good as the ledger behind it. When a statement
+  /// backlog finally imports, the old verdict has to go — this is why a
+  /// score of 90/100, written while the ledger was empty, went on being
+  /// shown after real data arrived.
+  Future<bool> _isReportStale(CoachReport report, DateTime now) async {
+    try {
+      final snap = json.decode(report.snapshotJson);
+      if (snap is! Map) return true;
+      final was = (snap['transaction_count'] as num?)?.toInt();
+      // Reports predating this field carry no baseline to compare against.
+      if (was == null) return true;
+      final current =
+          await repository.countTransactionsInMonth(now.year, now.month);
+      if (was == current) return false;
+      final delta = (current - was).abs();
+      final stale = delta >= 5 || (was > 0 && delta / was >= 0.2);
+      if (stale) {
+        debugPrint('🩺 Coach report stale ($was → $current txns) — regenerating');
+      }
+      return stale;
+    } catch (_) {
+      return false; // a malformed snapshot must not cause a regen loop
     }
   }
 }

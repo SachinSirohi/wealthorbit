@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 import '../features/dashboard/screens/home_screen.dart';
 import '../features/onboarding/screens/onboarding_screen.dart';
 import '../features/settings/screens/statement_automation_screen.dart';
+import '../features/health/screens/data_health_screen.dart';
 import '../features/net_worth/screens/net_worth_screen.dart';
 import '../features/real_estate/screens/real_estate_screen.dart';
 import '../features/goals/screens/goals_screen.dart';
@@ -26,6 +27,7 @@ class AppRoutes {
   static const String investments = '/investments';
   static const String reports = '/reports';
   static const String settings = '/settings';
+  static const String dataHealth = '/data-health';
   static const String transactions = '/transactions';
   static const String accounts = '/accounts';
   static const String assets = '/assets';
@@ -143,6 +145,13 @@ class AppRouter {
             pageBuilder: (context, state) => _buildPageWithAnimation(
               state,
               const FinancialCoachScreen(),
+            ),
+          ),
+          GoRoute(
+            path: AppRoutes.dataHealth,
+            pageBuilder: (context, state) => _buildPageWithAnimation(
+              state,
+              const DataHealthScreen(),
             ),
           ),
         ],

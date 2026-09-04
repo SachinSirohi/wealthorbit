@@ -1418,6 +1418,128 @@ class AppRepository {
   Future<void> deleteStatementQueueItem(String id) =>
     (_db.delete(_db.statementQueue)..where((t) => t.id.equals(id))).go();
     
+  /// Which months of each account's history the ledger actually covers.
+  ///
+  /// A ledger with holes looks exactly like a ledger without them — the
+  /// totals are simply wrong and nothing says so. This buckets every
+  /// transaction and every unresolved statement by account and month, so a
+  /// missing April is visible as a gap rather than as a quietly smaller
+  /// number. One pass over each table; no per-cell queries.
+  Future<List<AccountCoverage>> getCoverageMatrix({int months = 18}) async {
+    final now = DateTime.now();
+    final firstMonth = DateTime(now.year, now.month - (months - 1), 1);
+    final accounts = await getAllAccounts();
+    if (accounts.isEmpty) return const [];
+
+    // Transactions per (account, month).
+    final txCounts = <String, int>{};
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.transactionDate.isBiggerOrEqualValue(firstMonth)))
+        .get();
+    for (final t in rows) {
+      if (kHiddenStatuses.contains(t.status)) continue;
+      txCounts['${t.accountId}|${_monthKey(t.transactionDate)}'] =
+          (txCounts['${t.accountId}|${_monthKey(t.transactionDate)}'] ?? 0) + 1;
+      // A transfer also lands on the destination account.
+      if (t.transferAccountId != null) {
+        final k = '${t.transferAccountId}|${_monthKey(t.transactionDate)}';
+        txCounts[k] = (txCounts[k] ?? 0) + 1;
+      }
+    }
+
+    // Unresolved statements per (account, month). A statement email arrives
+    // after the period it covers, so it is attributed to the previous month
+    // as well as its own — whichever cell is empty is the one that matters.
+    final sources = await getAllStatementSources();
+    final accountBySource = {
+      for (final s in sources)
+        if (s.accountId != null) s.id: s.accountId!
+    };
+    final blocked = <String, int>{};
+    final queue = await (_db.select(_db.statementQueue)
+          ..where((q) => q.status.isIn(['failed', 'empty', 'pending'])))
+        .get();
+    for (final q in queue) {
+      final accountId = accountBySource[q.sourceId];
+      if (accountId == null) continue;
+      if (q.emailDate.isBefore(firstMonth)) continue;
+      final covered = DateTime(q.emailDate.year, q.emailDate.month - 1, 1);
+      for (final key in {_monthKey(q.emailDate), _monthKey(covered)}) {
+        blocked['$accountId|$key'] = (blocked['$accountId|$key'] ?? 0) + 1;
+      }
+    }
+
+    final out = <AccountCoverage>[];
+    for (final a in accounts) {
+      final cells = <MonthCoverage>[];
+      for (var i = 0; i < months; i++) {
+        final m = DateTime(now.year, now.month - (months - 1) + i, 1);
+        final key = '${a.id}|${_monthKey(m)}';
+        cells.add(MonthCoverage(
+          month: m,
+          transactions: txCounts[key] ?? 0,
+          blockedStatements: blocked[key] ?? 0,
+        ));
+      }
+      out.add(AccountCoverage(account: a, months: cells));
+    }
+    // Worst coverage first — that is what needs attention.
+    out.sort((x, y) => x.coveredMonths.compareTo(y.coveredMonths));
+    return out;
+  }
+
+  static String _monthKey(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}';
+
+  /// Errors worth retrying on their own: the statement is fine, the attempt
+  /// wasn't. A missing password or an unmapped sender needs the user, and
+  /// retrying those forever only burns battery and AI budget.
+  static bool isTransientFailure(String? error) {
+    final e = (error ?? '').toLowerCase();
+    if (e.isEmpty) return false;
+    if (e.contains('password')) return false;
+    if (e.contains('no account mapped')) return false;
+    if (e.contains('not a bank statement')) return false;
+    if (e.contains('no extractable text')) return false;
+    if (e.contains('already imported')) return false;
+    return e.contains('timeout') ||
+        e.contains('timed out') ||
+        e.contains('socket') ||
+        e.contains('connection') ||
+        e.contains('network') ||
+        e.contains('http 5') ||
+        e.contains('empty response') ||
+        e.contains('no windows succeeded') ||
+        e.contains('malformed');
+  }
+
+  /// Re-queue transient failures whose backoff has elapsed.
+  ///
+  /// Failed statements used to sit untouched until the user noticed and
+  /// tapped Retry, so one bad night of connectivity became a permanent hole.
+  /// Backoff doubles with each attempt (1h, 2h, 4h, 8h, 16h) and gives up
+  /// after [maxAttempts], at which point it is a real problem to surface
+  /// rather than retry.
+  Future<int> requeueRetryableFailures({int maxAttempts = 5}) async {
+    final now = DateTime.now();
+    final failed = await (_db.select(_db.statementQueue)
+          ..where((q) => q.status.equals('failed')))
+        .get();
+    int n = 0;
+    for (final item in failed) {
+      if (item.retryCount >= maxAttempts) continue;
+      if (!isTransientFailure(item.errorMessage)) continue;
+      final last = item.processedAt;
+      final waitHours = 1 << item.retryCount; // 1, 2, 4, 8, 16
+      if (last != null && now.difference(last).inHours < waitHours) continue;
+      await (_db.update(_db.statementQueue)..where((q) => q.id.equals(item.id)))
+          .write(const StatementQueueCompanion(status: Value('pending')));
+      n++;
+    }
+    if (n > 0) debugPrint('🔁 Auto-retrying $n transient statement failure(s)');
+    return n;
+  }
+
   /// Send already-processed statements back through extraction.
   ///
   /// Import guards have rejected real lines in the past (an over-tight
@@ -2309,4 +2431,42 @@ class AppRepository {
       netWorth: Value(assets + accounts - liabilities),
     ));
   }
+}
+
+
+/// One month of one account's ledger coverage.
+class MonthCoverage {
+  final DateTime month;
+  final int transactions;
+  final int blockedStatements;
+
+  const MonthCoverage({
+    required this.month,
+    required this.transactions,
+    required this.blockedStatements,
+  });
+
+  /// Imported something for this month.
+  bool get isCovered => transactions > 0;
+
+  /// Nothing imported, but a statement exists that could not be read — the
+  /// gap has a known cause and a fix.
+  bool get isBlocked => transactions == 0 && blockedStatements > 0;
+
+  /// Nothing imported and no statement either: the month may predate the
+  /// account, or the mail simply was not found.
+  bool get isMissing => transactions == 0 && blockedStatements == 0;
+}
+
+/// An account's month-by-month coverage, oldest first.
+class AccountCoverage {
+  final Account account;
+  final List<MonthCoverage> months;
+
+  const AccountCoverage({required this.account, required this.months});
+
+  int get coveredMonths => months.where((m) => m.isCovered).length;
+  int get blockedMonths => months.where((m) => m.isBlocked).length;
+  int get totalTransactions =>
+      months.fold(0, (sum, m) => sum + m.transactions);
 }

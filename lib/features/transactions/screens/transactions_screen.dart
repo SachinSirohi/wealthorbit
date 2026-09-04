@@ -330,10 +330,11 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
               child: ElevatedButton(
                 style: WoButtons.primary,
                 onPressed: () async {
+                  final messenger = ScaffoldMessenger.of(context);
                   final ok = await _repo!.restoreDuplicate(t.id);
                   if (!ctx.mounted) return;
                   Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  messenger.showSnackBar(SnackBar(
                     content: Text(ok
                         ? 'Restored — counted in your totals again'
                         : 'Could not restore'),
@@ -430,10 +431,11 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                     child: OutlinedButton(
                       style: WoButtons.ghost,
                       onPressed: () async {
+                        final messenger = ScaffoldMessenger.of(context);
                         final ok = await _repo!.unmergeTransferPair(t.id);
                         if (!ctx.mounted) return;
                         Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                        messenger.showSnackBar(SnackBar(
                           content: Text(ok ? 'Unmerged — both entries restored' : 'Could not unmerge'),
                         ));
                         _loadData();
