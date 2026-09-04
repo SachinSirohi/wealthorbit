@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'core/amount_sanity.dart';
 import 'core/theme/wo_design.dart';
 import 'data/services/secure_vault.dart';
 import 'data/services/notification_service.dart';
@@ -143,6 +144,28 @@ void main() async {
       }
     } catch (e) {
       debugPrint('pipeline_repair_v410 skipped: $e');
+    }
+
+    // One-shot (v4.1.1): v4.1.0's card repair retyped accounts to `bank`
+    // without checking the balance, which moved deeply negative card ledgers
+    // into the cash total. Put those back.
+    try {
+      if (!await repo.getBoolSetting('card_retype_guard_v411')) {
+        int n = 0;
+        for (final a in await repo.getAllAccounts()) {
+          if (a.type != 'bank') continue;
+          if (a.balance >= -AmountSanity.maxForCurrency(a.currencyCode) * 0.1) {
+            continue;
+          }
+          await repo.updateAccountType(a.id, 'credit_card');
+          n++;
+          debugPrint('↩️ ${a.name} back to credit_card (balance ${a.balance})');
+        }
+        await repo.setAppSetting('card_retype_guard_v411', 'true');
+        if (n > 0) debugPrint('🩹 Reverted $n mis-retyped account(s)');
+      }
+    } catch (e) {
+      debugPrint('card_retype_guard_v411 skipped: $e');
     }
 
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)

@@ -170,6 +170,41 @@ class AppRepository {
   /// converted to the base currency. Credit cards are debt instruments and
   /// are reported under liabilities instead — a card never inflates or
   /// deflates the "Accounts" cash figure.
+  /// True when an account's displayed balance is not trustworthy.
+  ///
+  /// A balance is only ever as good as the ledger behind it. When no bank
+  /// statement has ever anchored an account to a real closing balance AND
+  /// the running total has gone negative, what we have is a partial ledger
+  /// — debits imported, the matching credits missing — not an overdraft.
+  /// HDFC sat at −₹8.3M this way for months because every one of its
+  /// statements failed on its PDF password. Numbers like that must not
+  /// reach a headline; the account is surfaced for the user to fix instead.
+  /// Change an account's kind (bank ↔ credit_card ↔ brokerage). Balances are
+  /// recomputed because the sign convention differs between them.
+  Future<void> updateAccountType(String id, String type) async {
+    await (_db.update(_db.accounts)..where((a) => a.id.equals(id)))
+        .write(AccountsCompanion(type: Value(type)));
+    await recomputeAccountBalance(id);
+  }
+
+  Future<bool> isBalanceUntrustworthy(Account a) async {
+    if (a.type == 'credit_card' || a.type == 'brokerage') return false;
+    if (a.balance >= 0) return false;
+    final anchored = await getAppSetting('anchor_closing_${a.id}') ??
+        await getAppSetting('closing_date_${a.id}');
+    return anchored == null;
+  }
+
+  /// Accounts whose balance the app cannot vouch for, worst first.
+  Future<List<Account>> getUntrustworthyAccounts() async {
+    final out = <Account>[];
+    for (final a in await getAllAccounts()) {
+      if (await isBalanceUntrustworthy(a)) out.add(a);
+    }
+    out.sort((x, y) => x.balance.compareTo(y.balance));
+    return out;
+  }
+
   Future<double> getTotalAccountBalance() async {
     final accounts = await getAllAccounts();
     final rates = await _rates();
@@ -179,6 +214,8 @@ class AppRepository {
       // A brokerage account's balance is net contributions, not cash; its
       // worth is the holdings on the Invest tab. Counting both double-counts.
       if (a.type == 'brokerage') continue;
+      // Never let a balance we know is incomplete drag the headline.
+      if (await isBalanceUntrustworthy(a)) continue;
       total += a.balance * (rates[a.currencyCode] ?? 1.0);
     }
     return total;
@@ -349,6 +386,13 @@ class AppRepository {
       // Keep it a card if a mapped sender really is a card sender, or if the
       // user named it as one. Otherwise this was a mis-retype.
       if (CurrencyUtils.isCreditCardHint('$senderHints ${a.name}')) continue;
+      // A deeply negative balance is itself evidence the account holds card
+      // spend. Retyping it to `bank` moves that debt into the cash total,
+      // which is how a −₹8.3M "bank account" came to wreck the dashboard.
+      if (a.balance < -AmountSanity.maxForCurrency(a.currencyCode) * 0.1) {
+        debugPrint('↩️ Kept ${a.name} as credit_card (balance ${a.balance})');
+        continue;
+      }
 
       await (_db.update(_db.accounts)..where((x) => x.id.equals(a.id)))
           .write(const AccountsCompanion(

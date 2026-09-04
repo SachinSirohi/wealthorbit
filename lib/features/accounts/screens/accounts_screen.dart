@@ -25,6 +25,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
   bool _isLoading = true;
   double _totalBalance = 0;
   double _cardDebt = 0;
+  List<Account> _untrusted = [];
   String _base = 'AED';
 
   @override
@@ -55,6 +56,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       // Convert each account to the base currency for the headline total.
       final total = await _repo!.getTotalAccountBalance();
       final cardDebt = await _repo!.getCreditCardOutstanding();
+      final untrusted = await _repo!.getUntrustworthyAccounts();
       final base = await SecureVault.getBaseCurrency();
 
       if (!mounted) return;
@@ -62,6 +64,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
         _accounts = accounts;
         _totalBalance = total;
         _cardDebt = cardDebt;
+        _untrusted = untrusted;
         _base = base;
         _isLoading = false;
       });
@@ -159,6 +162,33 @@ class _AccountsScreenState extends State<AccountsScreen> {
                   ? '${_accounts.length} accounts · ${CurrencyUtils.format(_cardDebt, _base, decimals: 0)} card debt not included'
                   : '${_accounts.length} accounts connected',
               style: WoText.caption(color: WoColors.textLo)),
+            if (_untrusted.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: WoColors.red.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(CupertinoIcons.exclamationmark_triangle_fill,
+                        color: WoColors.red, size: 15),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '${_untrusted.map((a) => a.name).join(', ')} '
+                        '${_untrusted.length == 1 ? 'is' : 'are'} not counted above — '
+                        'no statement balance yet, so only part of the ledger is in. '
+                        'Add the PDF password in Statements & Automation and sync.',
+                        style: WoText.caption(color: WoColors.red),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
       ).animate().fadeIn().slideY(begin: 0.1),
