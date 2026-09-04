@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
 import '../../core/amount_sanity.dart';
+import '../../core/statement_date.dart';
 import '../database/database.dart';
 import '../repositories/app_repository.dart';
 import 'gemini_service.dart';
@@ -111,6 +112,7 @@ class StatementProcessor {
     String? statementId,
     String? sourceId,
     String? senderEmail,
+    DateTime? statementDate,
   }) async {
     final text = await _extractText(
       bytes: bytes,
@@ -157,6 +159,12 @@ class StatementProcessor {
     int count = 0;
     int skippedDupes = 0;
     int skippedAbsurd = 0;
+    int skippedUndated = 0;
+    // A statement covers the period BEFORE the email that carried it, so its
+    // own date is a far better guess for an unreadable line than today.
+    final fallbackDate = statementDate == null
+        ? null
+        : DateTime(statementDate.year, statementDate.month - 1, 15);
     // Peer set for the outlier guard: EXPENSES only. A salary credit or a
     // full card-bill payment legitimately dwarfs every purchase around it,
     // and comparing it against those peers threw away the real row.
@@ -169,8 +177,21 @@ class StatementProcessor {
     for (final tx in parsed) {
       final amount = (tx['amount'] as num?)?.toDouble() ?? 0;
       if (amount <= 0) continue;
-      final type = (tx['type'] ?? 'expense').toString();
-      final date = DateTime.tryParse((tx['date'] ?? '').toString()) ?? DateTime.now();
+      // Normalise to the two types the ledger understands. The model
+      // occasionally answers "refund" or "credit", and such rows matched
+      // neither the income nor the expense filter — so they sat in the
+      // database contributing to nothing at all.
+      final type = _normalizeType(tx['type']);
+
+      // A date that cannot be read must NOT become today. Doing so collapsed
+      // years of history onto the current month. Fall back to the period the
+      // statement covers, and if even that is unknown, skip the row and say
+      // so rather than filing it under a date we invented.
+      final date = StatementDate.parse((tx['date'] ?? '').toString()) ?? fallbackDate;
+      if (date == null) {
+        skippedUndated++;
+        continue;
+      }
       final description = (tx['description'] ?? '').toString();
       final merchant = tx['merchant'] as String?;
       final txnClass = (tx['txn_class'] ?? '').toString();
@@ -242,12 +263,15 @@ class StatementProcessor {
     if (skippedAbsurd > 0) {
       debugPrint('🛑 Skipped $skippedAbsurd absurd-amount lines for $accountId');
     }
+    if (skippedUndated > 0) {
+      debugPrint('📅 Skipped $skippedUndated lines with an unreadable date');
+    }
 
     // Only trust a closing balance that itself looks plausible.
     if (closingBalance != null && AmountSanity.isPlausible(closingBalance.abs(), currency)) {
       DateTime? stmtDate;
       for (final tx in parsed) {
-        final d = DateTime.tryParse((tx['date'] ?? '').toString());
+        final d = StatementDate.parse((tx['date'] ?? '').toString());
         if (d != null && (stmtDate == null || d.isAfter(stmtDate))) stmtDate = d;
       }
       await repository.applyClosingBalance(accountId, closingBalance, statementDate: stmtDate);
@@ -257,13 +281,22 @@ class StatementProcessor {
     return StatementImportResult(
       imported: count,
       duplicates: skippedDupes,
-      rejected: skippedAbsurd,
+      rejected: skippedAbsurd + skippedUndated,
       emptyReason: count > 0
           ? null
           : skippedDupes > 0
               ? 'Every transaction in this statement was already imported.'
               : 'No usable transactions were found in this statement.',
     );
+  }
+
+  /// Map whatever the model answered onto `income` or `expense`.
+  static String _normalizeType(Object? raw) {
+    final t = (raw ?? 'expense').toString().trim().toLowerCase();
+    const incomeWords = {
+      'income', 'i', 'credit', 'cr', 'refund', 'deposit', 'salary', 'inflow',
+    };
+    return incomeWords.contains(t) ? 'income' : 'expense';
   }
 
   /// The currency the statement itself reports, when it reports one

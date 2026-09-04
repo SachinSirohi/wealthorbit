@@ -380,6 +380,7 @@ Future<void> _processStatementQueue({
                       statementId: item.id,
                       sourceId: sourceId,
                       senderEmail: source?.senderEmail,
+                      statementDate: item.emailDate,
                     );
               transactionCount += result.imported;
               emptyReason ??= result.emptyReason;

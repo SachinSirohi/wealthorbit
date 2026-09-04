@@ -1418,6 +1418,48 @@ class AppRepository {
   Future<void> deleteStatementQueueItem(String id) =>
     (_db.delete(_db.statementQueue)..where((t) => t.id.equals(id))).go();
     
+  /// Unmap statement sources that point at an account belonging to a
+  /// different bank.
+  ///
+  /// Before the destination-account guard existed, a source with no mapping
+  /// was silently pointed at `accounts.first`. On this install that put Axis,
+  /// SBI, HDFC and Kotak senders onto an AED Emirates NBD card, where their
+  /// rupee amounts were relabelled AED and multiplied by the AED rate.
+  ///
+  /// Only unmaps where the bank is recognisable and clearly different — a
+  /// source whose bank could not be identified ("Unknown Bank") is left
+  /// alone, because it may genuinely belong to the account it points at.
+  /// Unmapped sources then fail loudly with "map this sender", which is a
+  /// question the user can answer, instead of quietly corrupting a ledger.
+  Future<int> unmapMisroutedSources() async {
+    final sources = await getAllStatementSources();
+    final accounts = await getAllAccounts();
+    final byId = {for (final a in accounts) a.id: a};
+    int n = 0;
+    for (final s in sources) {
+      if (s.accountId == null) continue;
+      final account = byId[s.accountId];
+      if (account == null) continue;
+      final bank = s.bankName.trim().toLowerCase();
+      if (bank.isEmpty || bank == 'unknown bank' || bank == 'unknown source') {
+        continue;
+      }
+      final accountName = account.name.trim().toLowerCase();
+      // Same institution if either name contains the other's first word —
+      // "HDFC Bank" vs "HDFC Bank Card" must not count as a mismatch.
+      final bankWord = bank.split(RegExp(r'\s+')).first;
+      final accountWord = accountName.split(RegExp(r'\s+')).first;
+      if (bankWord == accountWord) continue;
+      if (accountName.contains(bankWord) || bank.contains(accountWord)) continue;
+
+      await updateStatementSource(
+          s.id, const StatementSourcesCompanion(accountId: Value(null)));
+      n++;
+      debugPrint('🔀 Unmapped ${s.bankName} from ${account.name} (wrong bank)');
+    }
+    return n;
+  }
+
   /// Which months of each account's history the ledger actually covers.
   ///
   /// A ledger with holes looks exactly like a ledger without them — the

@@ -169,6 +169,19 @@ void main() async {
       debugPrint('card_retype_guard_v411 skipped: $e');
     }
 
+    // One-shot (v4.2.1): sources that the old "route to the first account"
+    // fallback pointed at the wrong bank are unmapped, so they ask to be
+    // mapped rather than importing rupees into an AED card.
+    try {
+      if (!await repo.getBoolSetting('unmap_misrouted_sources_v421')) {
+        final n = await repo.unmapMisroutedSources();
+        await repo.setAppSetting('unmap_misrouted_sources_v421', 'true');
+        if (n > 0) debugPrint('🔀 Unmapped $n misrouted source(s)');
+      }
+    } catch (e) {
+      debugPrint('unmap_misrouted_sources_v421 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {

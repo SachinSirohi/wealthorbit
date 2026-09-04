@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:wealth_orbit/core/amount_sanity.dart';
+import 'package:wealth_orbit/core/statement_date.dart';
 import 'package:wealth_orbit/core/utils/currency_utils.dart';
 import 'package:wealth_orbit/data/repositories/app_repository.dart';
 import 'package:wealth_orbit/data/services/statement_processor.dart';
@@ -207,6 +208,78 @@ void main() {
       final c = MonthCoverage(month: m, transactions: 5, blockedStatements: 3);
       expect(c.isCovered, isTrue);
       expect(c.isBlocked, isFalse);
+    });
+  });
+
+  group('StatementDate.parse', () {
+    final now = DateTime(2026, 9, 5);
+
+    test('reads every format banks actually print', () {
+      final expected = DateTime(2026, 8, 14);
+      for (final raw in [
+        '2026-08-14',
+        '14-08-2026',
+        '14/08/2026',
+        '14.08.2026',
+        '14-Aug-2026',
+        '14 Aug 2026',
+        '14-August-2026',
+        'Aug 14, 2026',
+        '14/08/26',
+        '2026/08/14',
+        '20260814',
+      ]) {
+        expect(StatementDate.parse(raw, now: now), equals(expected), reason: raw);
+      }
+    });
+
+    test('prefers day-first for ambiguous numeric dates', () {
+      // UAE and Indian statements are day-first; 03/04 is 3 April.
+      expect(StatementDate.parse('03/04/2026', now: now),
+          equals(DateTime(2026, 4, 3)));
+    });
+
+    test('uses the unambiguous component when there is one', () {
+      // 13 cannot be a month, so this is 13 May whichever way round it is.
+      expect(StatementDate.parse('13/05/2026', now: now),
+          equals(DateTime(2026, 5, 13)));
+      // 25 cannot be a month either.
+      expect(StatementDate.parse('05/25/2026', now: now),
+          equals(DateTime(2026, 5, 25)));
+    });
+
+    test('rejects dates in the future instead of trusting them', () {
+      // Transactions dated 2028 reached a 2026 ledger because nothing checked.
+      expect(StatementDate.parse('2028-06-29', now: now), isNull);
+      expect(StatementDate.parse('2026-12-31', now: now), isNull);
+    });
+
+    test('allows a couple of days of timezone slack', () {
+      expect(StatementDate.parse('2026-09-06', now: now), isNotNull);
+    });
+
+    test('rejects the implausibly old', () {
+      expect(StatementDate.parse('1974-05-02', now: now), isNull);
+    });
+
+    test('rejects impossible calendar dates rather than rolling them over', () {
+      expect(StatementDate.parse('31-02-2026', now: now), isNull);
+      expect(StatementDate.parse('32/01/2026', now: now), isNull);
+      expect(StatementDate.parse('00-08-2026', now: now), isNull);
+    });
+
+    test('returns null for junk, so the caller can fall back deliberately', () {
+      for (final raw in [null, '', '   ', 'n/a', 'Opening Balance', '--']) {
+        expect(StatementDate.parse(raw, now: now), isNull, reason: '$raw');
+      }
+    });
+
+    test('expands two-digit years sensibly', () {
+      expect(StatementDate.parse('14-08-26', now: now), equals(DateTime(2026, 8, 14)));
+      expect(StatementDate.parse('14-08-24', now: now), equals(DateTime(2024, 8, 14)));
+      // '98' expands to 1998, which the plausibility window then rejects —
+      // a 1998 line in a statement is a misread, not history.
+      expect(StatementDate.parse('14-08-98', now: now), isNull);
     });
   });
 }
