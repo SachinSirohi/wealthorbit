@@ -406,7 +406,7 @@ void main() {
   group('SecureVault.looksLikeGeminiKey', () {
     test('recognises a Google key', () {
       expect(
-        SecureVault.looksLikeGeminiKey('AIzaSyD-ExampleKeyMaterial_1234567890abc'),
+        SecureVault.looksLikeGeminiKey('AIzaFAKEKEYFORTESTSONLY000000000000000'),
         isTrue,
       );
     });
@@ -414,7 +414,7 @@ void main() {
     test('does not mistake the Qwen key for one', () {
       // The two shared a slot until 4.4.0; telling them apart is what stops
       // a Qwen key being sent to Google and a Google key being overwritten.
-      expect(SecureVault.looksLikeGeminiKey('sk-Z4lhkfYqsHh489KuLnNjMw'), isFalse);
+      expect(SecureVault.looksLikeGeminiKey('sk-FAKEKEYFORTESTSONLY00'), isFalse);
       expect(SecureVault.looksLikeGeminiKey('AIza-too-short'), isFalse);
       expect(SecureVault.looksLikeGeminiKey(''), isFalse);
     });
