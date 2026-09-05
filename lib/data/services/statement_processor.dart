@@ -158,6 +158,19 @@ class StatementProcessor {
       );
     }
 
+    // Re-reading a statement must REPLACE what it produced last time. Ids
+    // are content-derived including the date, so a corrected date yields a
+    // new id that matches nothing and would be inserted beside the wrong
+    // row. Done only now that parsing has succeeded, so a failed extraction
+    // never costs the data already on file.
+    if (statementId != null) {
+      final superseded =
+          await repository.supersedeStatementTransactions(statementId);
+      if (superseded > 0) {
+        debugPrint('♻️ Superseded $superseded row(s) from a previous read');
+      }
+    }
+
     int count = 0;
     int skippedDupes = 0;
     int skippedAbsurd = 0;
@@ -290,6 +303,28 @@ class StatementProcessor {
               ? 'Every transaction in this statement was already imported.'
               : 'No usable transactions were found in this statement.',
     );
+  }
+
+  /// Why a brokerage statement yielded no holdings.
+  ///
+  /// Most broker mail is not a holdings report at all: Zerodha sends a
+  /// weekly "Statement of Account of Securities" listing the week's
+  /// transactions, which is empty in a week with no trades. Reporting that
+  /// as a failure sends the user hunting for a problem that does not exist.
+  /// Positions live in the monthly CDSL/NSDL consolidated account statement.
+  static String _noHoldingsReason(String text) {
+    final t = text.toLowerCase();
+    final looksTransactional = RegExp(
+      r'statement of account|transaction date|execution date|pending obligation|'
+      r'settlement|contract note|ledger',
+    ).hasMatch(t);
+    if (looksTransactional) {
+      return 'This is a transaction statement, not a holdings report — it '
+          'lists trades for the period, not what you own. Portfolio positions '
+          'come from the monthly CDSL/NSDL consolidated account statement '
+          '(CAS); add edcas@cdslindia.com as a source to import them.';
+    }
+    return 'No holdings were found in this portfolio statement.';
   }
 
   /// Write the first few thousand characters of a brokerage statement to
@@ -434,8 +469,9 @@ class StatementProcessor {
     debugPrint('📈 ${bankName ?? accountId}: upserted $count holdings');
     return StatementImportResult(
       imported: count,
-      emptyReason:
-          count > 0 ? null : 'No holdings were found in this portfolio statement.',
+      emptyReason: count > 0
+          ? null
+          : _noHoldingsReason(text),
     );
   }
 }

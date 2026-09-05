@@ -205,6 +205,23 @@ void main() async {
       debugPrint('ledger_rebuild_v430 skipped: $e');
     }
 
+    // One-shot (v4.4.2): the 4.3.0 rebuild re-read statements without
+    // superseding what the previous read produced, so corrected dates were
+    // inserted BESIDE the wrong rows rather than replacing them. Quarantine
+    // everything statement-derived and read them all again, now that
+    // extraction supersedes properly. Manual entries are untouched.
+    try {
+      if (!await repo.getBoolSetting('clean_rebuild_v442')) {
+        final superseded = await repo.quarantineAllStatementTransactions();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('clean_rebuild_v442', 'true');
+        debugPrint('🧱 Clean rebuild: $superseded row(s) quarantined, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('clean_rebuild_v442 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {

@@ -1420,6 +1420,64 @@ class AppRepository {
   Future<void> deleteStatementQueueItem(String id) =>
     (_db.delete(_db.statementQueue)..where((t) => t.id.equals(id))).go();
     
+  /// Take out the transactions a previous extraction of [statementId]
+  /// produced, so re-reading a statement REPLACES its rows instead of adding
+  /// a second set beside them.
+  ///
+  /// Transaction ids are derived from content including the date, and the
+  /// duplicate gate matches on the same calendar day. So when a statement is
+  /// re-read and a date that was previously wrong comes out right, the row
+  /// gets a new id, matches nothing, and is inserted alongside the bad one.
+  /// The whole point of the 4.3.0 rebuild was correcting dates, which made
+  /// every re-extraction a double-count.
+  ///
+  /// Rows are quarantined rather than deleted: if the new extraction fails,
+  /// the old data is still on file rather than gone.
+  Future<int> supersedeStatementTransactions(String statementId) async {
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.sourceStatementId.equals(statementId) &
+              t.status.isIn(kHiddenStatuses).not()))
+        .get();
+    if (rows.isEmpty) return 0;
+    final accounts = <String>{};
+    for (final t in rows) {
+      accounts.add(t.accountId);
+      await (_db.update(_db.transactions)..where((x) => x.id.equals(t.id)))
+          .write(const TransactionsCompanion(status: Value(kQuarantinedStatus)));
+    }
+    for (final id in accounts) {
+      await recomputeAccountBalance(id);
+    }
+    return rows.length;
+  }
+
+  /// Quarantine every transaction that came from a statement, so the whole
+  /// ledger can be rebuilt from a fresh read. Manually entered rows, which
+  /// have no source statement, are left alone.
+  Future<int> quarantineAllStatementTransactions() async {
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.sourceStatementId.isNotNull() &
+              t.status.isIn(kHiddenStatuses).not()))
+        .get();
+    if (rows.isEmpty) return 0;
+    final accounts = <String>{};
+    for (final t in rows) {
+      accounts.add(t.accountId);
+      await (_db.update(_db.transactions)..where((x) => x.id.equals(t.id)))
+          .write(const TransactionsCompanion(status: Value(kQuarantinedStatus)));
+    }
+    for (final id in accounts) {
+      // Anchors were derived from rows that are now set aside; drop them so
+      // the next real statement re-establishes each balance.
+      await (_db.delete(_db.appSettings)..where((x) => x.key.equals('closing_date_$id'))).go();
+      await (_db.delete(_db.appSettings)..where((x) => x.key.equals('anchor_closing_$id'))).go();
+      await (_db.update(_db.accounts)..where((a) => a.id.equals(id)))
+          .write(const AccountsCompanion(openingBalance: Value(0)));
+      await recomputeAccountBalance(id);
+    }
+    return rows.length;
+  }
+
   /// Give every unmapped source the account its statements belong in,
   /// creating that account when it does not exist yet.
   ///
