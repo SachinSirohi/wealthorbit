@@ -41,6 +41,17 @@ const List<String> kHiddenStatuses = [
 /// because the transfer row already stands for it.
 const List<String> kLedgerHiddenStatuses = [kMergedStatus, kQuarantinedStatus];
 
+/// Transaction classes that move money between the user's OWN accounts and
+/// are therefore neither income nor spending.
+///
+/// A credit-card repayment is the clearest case: on the card statement it is
+/// a positive number, so it arrives typed `income` and inflates earnings by
+/// the whole bill; on the bank statement it is a debit, and counting that as
+/// spending double-counts purchases already recorded on the card. It belongs
+/// in neither total. The row stays in the ledger and still moves both
+/// balances — a card credit correctly reduces what is owed.
+const List<String> kInternalTransferClasses = ['cc_payment'];
+
 /// Repository for all database operations
 class AppRepository {
   final AppDatabase _db;
@@ -755,7 +766,10 @@ class AppRepository {
       ..where((t) => t.transactionDate.isBiggerOrEqualValue(start))
       ..where((t) => t.transactionDate.isSmallerThanValue(end))
       ..where((t) => t.type.equals('expense'))
-      ..where((t) => t.status.isIn(kHiddenStatuses).not())).get();
+      ..where((t) => t.status.isIn(kHiddenStatuses).not())
+      // Paying your own card is not earning or spending.
+      ..where((t) => t.txnClass.isIn(kInternalTransferClasses).not() |
+          t.txnClass.isNull())).get();
     double total = 0.0;
     for (final t in transactions) {
       total += t.amountBase;
@@ -770,7 +784,10 @@ class AppRepository {
       ..where((t) => t.transactionDate.isBiggerOrEqualValue(start))
       ..where((t) => t.transactionDate.isSmallerThanValue(end))
       ..where((t) => t.type.equals('income'))
-      ..where((t) => t.status.isIn(kHiddenStatuses).not())).get();
+      ..where((t) => t.status.isIn(kHiddenStatuses).not())
+      // Paying your own card is not earning or spending.
+      ..where((t) => t.txnClass.isIn(kInternalTransferClasses).not() |
+          t.txnClass.isNull())).get();
     double total = 0.0;
     for (final t in transactions) {
       total += t.amountBase;
@@ -800,7 +817,9 @@ class AppRepository {
     final transactions = await (_db.select(_db.transactions)
       ..where((t) => t.transactionDate.isBetweenValues(start, end))
       ..where((t) => t.type.equals('expense'))
-      ..where((t) => t.status.isIn(kHiddenStatuses).not())).get();
+      ..where((t) => t.status.isIn(kHiddenStatuses).not())
+      ..where((t) => t.txnClass.isIn(kInternalTransferClasses).not() |
+          t.txnClass.isNull())).get();
     
     final categories = await getAllCategories();
     final categoryMap = {for (var c in categories) c.id: c.name};
@@ -1449,6 +1468,44 @@ class AppRepository {
       await recomputeAccountBalance(id);
     }
     return rows.length;
+  }
+
+  /// Reclassify credits already imported against a credit card.
+  ///
+  /// Everything imported before this release typed a card repayment as
+  /// income, because on the statement it is just a positive number. Those
+  /// rows are still in the ledger inflating earnings, and re-extraction only
+  /// fixes the ones that get re-read. Returns how many were corrected.
+  Future<int> reclassifyCardCredits() async {
+    final cards = (await getAllAccounts())
+        .where((a) => a.type == 'credit_card')
+        .map((a) => a.id)
+        .toList();
+    if (cards.isEmpty) return 0;
+
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.accountId.isIn(cards) &
+              t.type.equals('income') &
+              t.status.isIn(kHiddenStatuses).not()))
+        .get();
+    int n = 0;
+    for (final t in rows) {
+      final refund = RegExp(
+        r'refund|reversal|reversed|cashback|cash back|chargeback|charge back|'
+        r'goods return|returned|credit adjustment|waiver|dispute',
+        caseSensitive: false,
+      ).hasMatch('${t.description} ${t.merchant ?? ''}');
+      final wanted = refund ? 'refund' : 'cc_payment';
+      if (t.txnClass == wanted) continue;
+      await (_db.update(_db.transactions)..where((x) => x.id.equals(t.id)))
+          .write(TransactionsCompanion(
+        txnClass: Value(wanted),
+        categoryId: Value(refund ? 'cat_refund' : null),
+      ));
+      n++;
+    }
+    if (n > 0) debugPrint('💳 Reclassified $n card credit(s) out of income');
+    return n;
   }
 
   /// Quarantine every transaction that came from a statement, so the whole

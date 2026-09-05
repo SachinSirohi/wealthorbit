@@ -173,14 +173,14 @@ class GeminiService {
   /// THE MIDDLE — so a multi-page statement silently lost most of its
   /// transactions while still reporting success.
   static Future<List<Map<String, dynamic>>> parseStatementText(
-      String statementText) async {
+      String statementText, {bool isCreditCard = false}) async {
     if (!_ready && !await initialize()) {
       throw Exception('AI is not configured. Add your API key in Settings.');
     }
 
     final windows = _splitStatement(statementText);
     if (windows.length == 1) {
-      return _parseStatementWindow(windows.first);
+      return _parseStatementWindow(windows.first, isCreditCard: isCreditCard);
     }
 
     debugPrint('📄 Statement split into ${windows.length} windows '
@@ -194,7 +194,7 @@ class GeminiService {
 
     for (var i = 0; i < windows.length; i++) {
       try {
-        final rows = await _parseStatementWindow(windows[i]);
+        final rows = await _parseStatementWindow(windows[i], isCreditCard: isCreditCard);
         succeeded++;
         // The closing balance is usually printed in the summary block at the
         // top; fall back to any later window that reports one.
@@ -247,7 +247,7 @@ class GeminiService {
   }
 
   static Future<List<Map<String, dynamic>>> _parseStatementWindow(
-      String clipped) async {
+      String clipped, {bool isCreditCard = false}) async {
     // COMPACT ROW FORMAT. The original prompt asked for a 9-field object per
     // transaction, which cost ~117 output tokens each; at this deployment's
     // measured 8-17 tok/s a 28-line statement took ~400s and a 90-line one
@@ -266,6 +266,12 @@ Each transaction is a 5-element ARRAY, not an object:
   desc   short description (max 40 chars)
   amount positive number, never negative
   kind   "e" for debit/withdrawal/purchase, "i" for credit/deposit/refund/salary
+${isCreditCard ? '''
+IMPORTANT — this is a CREDIT CARD statement:
+  * A credit here is almost always YOUR REPAYMENT of the card bill, not
+    income. Use cat "debt" for it, never "salary" or "business".
+  * Only use cat "refund" for an actual merchant refund, reversal,
+    chargeback or cashback.''' : ''}
   cat    one of: housing utilities groceries transport insurance dining leisure
          travel shopping subscriptions investments savings debt salary business
          interest refund rent_income other
@@ -370,7 +376,12 @@ $clipped
     if (RegExp(r'\bsip\b|mutual fund|zerodha|groww|invest').hasMatch(s)) {
       return 'investment';
     }
-    if (RegExp(r'\bneft\b|\bimps\b|\brtgs\b|self|own account').hasMatch(s)) {
+    // NEFT, IMPS and RTGS are just rails — rent, school fees and paying a
+    // contractor all travel on them. Treating them as own-account transfers
+    // wrongly excused real spending from the totals.
+    if (RegExp(r'\bto self\b|\bself transfer\b|\bown account\b|'
+            r'\bsame bank transfer\b')
+        .hasMatch(s)) {
       return 'own_transfer';
     }
     if (RegExp(r'charge|fee|gst|interest levied').hasMatch(s)) return 'fee';

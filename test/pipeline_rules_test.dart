@@ -419,4 +419,49 @@ void main() {
       expect(SecureVault.looksLikeGeminiKey(''), isFalse);
     });
   });
+
+  group('credit-card credits are repayments, not income', () {
+    // On a card statement a repayment is simply a positive number, so the
+    // extractor types it "income" and it inflated earnings by the whole
+    // bill every month. These pin the rule that fixes it.
+    bool isRefund(String d) => RegExp(
+          r'refund|reversal|reversed|cashback|cash back|chargeback|charge back|'
+          r'goods return|returned|credit adjustment|waiver|dispute',
+          caseSensitive: false,
+        ).hasMatch(d);
+
+    test('a repayment is not treated as a refund', () {
+      for (final d in [
+        'PAYMENT RECEIVED - THANK YOU',
+        'PAYMENT - ONLINE',
+        'AUTOPAY DEBIT',
+        'NEFT PAYMENT RECEIVED',
+        'UPI/CRED/CARD BILL',
+        'Payment Thank You',
+      ]) {
+        expect(isRefund(d), isFalse, reason: d);
+      }
+    });
+
+    test('an actual refund still is one', () {
+      for (final d in [
+        'AMAZON REFUND',
+        'REVERSAL OF LATE FEE',
+        'CASHBACK CREDIT',
+        'CHARGEBACK SETTLED',
+        'ANNUAL FEE WAIVER',
+        'GOODS RETURN CREDIT',
+      ]) {
+        expect(isRefund(d), isTrue, reason: d);
+      }
+    });
+
+    test('card repayments are named as internal movement', () {
+      // Neither income nor spending: the purchases were already counted on
+      // the card, and paying it from the bank would count them twice.
+      expect(kInternalTransferClasses, contains('cc_payment'));
+      expect(kInternalTransferClasses, isNot(contains('purchase')));
+      expect(kInternalTransferClasses, isNot(contains('income')));
+    });
+  });
 }

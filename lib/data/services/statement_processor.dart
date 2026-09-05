@@ -134,9 +134,11 @@ class StatementProcessor {
     // is the value converted into the user's base currency for aggregates.
     final account = await repository.getAccount(accountId);
     final currency = account?.currencyCode ?? 'AED';
+    final isCardAccount = account?.type == 'credit_card';
     final rateToBase = (await repository.getCurrency(currency))?.rateToBase ?? 1.0;
 
-    final parsed = await GeminiService.parseStatementText(text);
+    final parsed =
+        await GeminiService.parseStatementText(text, isCreditCard: isCardAccount);
     final closingBalance = GeminiService.lastClosingBalance;
     if (parsed.isEmpty) {
       return const StatementImportResult(
@@ -209,7 +211,17 @@ class StatementProcessor {
       }
       final description = (tx['description'] ?? '').toString();
       final merchant = tx['merchant'] as String?;
-      final txnClass = (tx['txn_class'] ?? '').toString();
+      // On a CREDIT CARD, a credit is a repayment, not income — money you
+      // sent the card, not money you earned. The extractor cannot know
+      // this: on the statement it is simply a positive number, so it comes
+      // back typed "income" and inflates earnings by the whole card bill
+      // every month. The account type is the missing piece, and inverting
+      // the test is what makes it reliable: on a card, a credit is a
+      // PAYMENT unless it is plainly a refund.
+      var txnClass = (tx['txn_class'] ?? '').toString();
+      if (isCardAccount && type == 'income') {
+        txnClass = _looksLikeRefund(description) ? 'refund' : 'cc_payment';
+      }
 
       // Large-but-real rows (income, card payments, investment funding) are
       // exempt from the peer-outlier test; the absolute ceiling still applies.
@@ -304,6 +316,15 @@ class StatementProcessor {
               : 'No usable transactions were found in this statement.',
     );
   }
+
+  /// A credit on a card statement that really is money coming back to you,
+  /// rather than a repayment you made.
+  static bool _looksLikeRefund(String description) => RegExp(
+        r'refund|reversal|reversed|cashback|cash back|chargeback|charge back|'
+        r'goods return|returned|credit adjustment|adjustment credit|'
+        r'annual fee waiver|waiver|dispute',
+        caseSensitive: false,
+      ).hasMatch(description);
 
   /// Why a brokerage statement yielded no holdings.
   ///

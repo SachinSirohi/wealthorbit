@@ -222,6 +222,16 @@ void main() async {
       debugPrint('clean_rebuild_v442 skipped: $e');
     }
 
+    // Card repayments arrive as positive numbers on the card statement, so
+    // everything imported before 4.5.0 typed them as income. Correct the
+    // rows already on file — re-extraction only fixes what it re-reads.
+    // Cheap and idempotent, so it runs every launch.
+    try {
+      await repo.reclassifyCardCredits();
+    } catch (e) {
+      debugPrint('reclassifyCardCredits skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {
