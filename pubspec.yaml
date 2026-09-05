@@ -1,7 +1,7 @@
 name: wealth_orbit
 description: "WealthOrbit - Global Personal Finance Command Center with AI-powered automation"
 publish_to: 'none'
-version: 4.5.0+25
+version: 4.5.1+26
 
 environment:
   sdk: ^3.10.1

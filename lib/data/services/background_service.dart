@@ -110,7 +110,15 @@ void callbackDispatcher() {
     // possible, so this is how the ledger's state can be reviewed over ADB.
     try {
       final db = AppRepository.database ?? AppDatabase();
-      await DiagnosticsService.dump(db, AppRepository.withDatabase(db));
+      final repo = AppRepository.withDatabase(db);
+      // Cheap, idempotent ledger repairs that must not wait for the user to
+      // open the app — a fix shipped silently is inert until it runs.
+      try {
+        await repo.reclassifyCardCredits();
+      } catch (e) {
+        debugPrint('reclassifyCardCredits skipped: $e');
+      }
+      await DiagnosticsService.dump(db, repo);
     } catch (e) {
       debugPrint('Diagnostics dump skipped: $e');
     }
