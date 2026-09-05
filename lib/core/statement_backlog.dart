@@ -10,7 +10,11 @@ class StatementBacklog {
   static const int lookbackYears = 3;
   static const int lookbackDays = 1095; // 3 × 365
   static const int onboardImmediatePerSource = 2;
-  static const int drainBatchSize = 8;
+  /// Statements per drain. Sized for Gemini, which answers a window in
+  /// seconds; the self-hosted fallback took ~100s each, which is why this
+  /// was 8. The wall-clock deadline in the drain is the real guard, so a
+  /// generous batch simply means fewer taps to clear a backlog.
+  static const int drainBatchSize = 40;
   static const int incrementalFetchDays = 45;
 
   /// App-settings flag: full historical enqueue already ran for this install.

@@ -96,10 +96,10 @@ class GeminiService {
   /// Which engine served the last request, for diagnostics and the UI.
   static String get activeEngine {
     final p = LlmRouter.lastProvider;
-    if (p == null) return 'not used yet';
+    if (p == null) return 'idle';
     return p == LlmProvider.gemini
-        ? 'Gemini (${LlmRouter.lastModel ?? "flash"})'
-        : 'Qwen (fallback)';
+        ? 'last used ${LlmRouter.lastModel ?? "Gemini"}'
+        : 'last fell back to Qwen';
   }
 
   /// Check if the API key is valid. Returns null if valid, or an error message.

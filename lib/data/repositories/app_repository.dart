@@ -1508,6 +1508,22 @@ class AppRepository {
     return n;
   }
 
+  /// Re-open statements that closed themselves as "already imported" while
+  /// the duplicate gate was matching against rows that had been set aside.
+  Future<int> requeueFalselyEmptyStatements() async {
+    final rows = await (_db.select(_db.statementQueue)
+          ..where((q) => q.status.equals('empty')))
+        .get();
+    int n = 0;
+    for (final row in rows) {
+      final reason = (row.errorMessage ?? '').toLowerCase();
+      if (!reason.contains('already imported')) continue;
+      await updateStatementQueueStatus(row.id, 'pending', errorMessage: null);
+      n++;
+    }
+    return n;
+  }
+
   /// Quarantine every transaction that came from a statement, so the whole
   /// ledger can be rebuilt from a fresh read. Manually entered rows, which
   /// have no source statement, are left alone.
@@ -2560,7 +2576,13 @@ class AppRepository {
       ..where((t) => t.accountId.equals(accountId)
         & t.type.equals(type)
         & t.transactionDate.isBiggerOrEqualValue(dayStart)
-        & t.transactionDate.isSmallerThanValue(dayEnd))).get();
+        & t.transactionDate.isSmallerThanValue(dayEnd)
+        // A row that has been set aside does not block its own replacement.
+        // Superseding a statement's rows and then asking "does this already
+        // exist?" found the very rows just quarantined and skipped every
+        // line, so a re-read imported nothing and reported "already
+        // imported" — which is exactly how a rebuild emptied the ledger.
+        & t.status.isIn(kHiddenStatuses).not())).get();
     final needle = _normalizeDescription(description ?? '');
     return rows.any((t) {
       if ((t.amountSource - amountSource).abs() >= 0.01) return false;

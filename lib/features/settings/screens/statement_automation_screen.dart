@@ -240,36 +240,40 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // Title and count on their own line: three buttons alongside an
+        // Expanded header squeezed it until "Processing Queue" wrapped to
+        // one letter per line.
         Row(
           children: [
             Expanded(child: WoSectionHeader('Processing Queue', padding: EdgeInsets.zero)),
             if (_queue.isNotEmpty)
-              WoChip('${_queue.length} Pending', color: WoColors.gold),
-            TextButton.icon(
+              WoChip('${_queue.length} pending', color: WoColors.gold),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 6,
+          runSpacing: 4,
+          children: [
+            _queueAction(
+              icon: CupertinoIcons.chart_bar_alt_fill,
+              label: 'Data health',
               onPressed: () => context.push(AppRoutes.dataHealth),
-              icon: Icon(CupertinoIcons.chart_bar_alt_fill, color: WoColors.gold, size: 16),
-              label: Text('Data health',
-                  style: GoogleFonts.inter(color: WoColors.gold, fontSize: 12.5, fontWeight: FontWeight.w600)),
             ),
-            TextButton.icon(
+            _queueAction(
+              icon: Icons.upload_file,
+              label: 'Upload PDF',
               onPressed: _uploadManualStatement,
-              icon: Icon(Icons.upload_file, color: WoColors.gold, size: 16),
-              label: Text('Upload PDF',
-                  style: GoogleFonts.inter(color: WoColors.gold, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            ),
+            _queueAction(
+              icon: CupertinoIcons.arrow_2_circlepath,
+              label: 'Re-extract processed',
+              onPressed: _reExtractProcessed,
+              muted: true,
             ),
           ],
         ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton.icon(
-            onPressed: _reExtractProcessed,
-            style: TextButton.styleFrom(padding: EdgeInsets.zero, visualDensity: VisualDensity.compact),
-            icon: Icon(CupertinoIcons.arrow_2_circlepath, color: WoColors.textMid, size: 14),
-            label: Text('Re-extract processed statements',
-                style: GoogleFonts.inter(color: WoColors.textMid, fontSize: 12)),
-          ),
-        ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 14),
         if (_queue.isEmpty)
           Container(
             width: double.infinity,
@@ -289,7 +293,10 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
               child: Text(
-                'Newest ${StatementBacklog.drainBatchSize} shown. ${_queue.length - StatementBacklog.drainBatchSize} older statements from the last ${StatementBacklog.lookbackYears} years are queued — Sync Now processes ${StatementBacklog.drainBatchSize} at a time, newest first.',
+                '${_queue.length} statements queued from the last '
+                '${StatementBacklog.lookbackYears} years, newest first. '
+                'Sync Now works through them until it runs out of time, then '
+                'picks up where it left off.',
                 style: WoText.caption(),
               ),
             ),
@@ -799,6 +806,28 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     );
   }
 
+  Widget _queueAction({
+    required IconData icon,
+    required String label,
+    required VoidCallback onPressed,
+    bool muted = false,
+  }) {
+    final color = muted ? WoColors.textMid : WoColors.gold;
+    return TextButton.icon(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        visualDensity: VisualDensity.compact,
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      icon: Icon(icon, color: color, size: 15),
+      label: Text(label,
+          style: GoogleFonts.inter(
+              color: color, fontSize: 12.5, fontWeight: FontWeight.w600)),
+    );
+  }
+
   /// Which engines are configured. Gemini leads and Qwen backs it up, so
   /// both matter to what this card should say.
   Future<({bool any, bool gemini})> _llmKeyState() async => (
@@ -839,7 +868,7 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                             : hasGemini
                                 // Gemini leads; Qwen only picks up calls it
                                 // cannot serve, one at a time.
-                                ? 'Gemini · Qwen fallback · ${GeminiService.activeEngine} last'
+                                ? 'Gemini, with Qwen as fallback · ${GeminiService.activeEngine}'
                                 : 'qwen-14b only — add a Gemini key for faster extraction',
                         style: GoogleFonts.inter(
                           color: !configured

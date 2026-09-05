@@ -232,6 +232,20 @@ void main() async {
       debugPrint('reclassifyCardCredits skipped: $e');
     }
 
+    // One-shot (v4.5.2): the rebuild quarantined each statement's rows and
+    // then the duplicate gate matched against those very rows, so every
+    // re-read imported nothing and closed itself as "already imported".
+    // Re-open them now the gate ignores set-aside rows.
+    try {
+      if (!await repo.getBoolSetting('requeue_false_empty_v452')) {
+        final n = await repo.requeueFalselyEmptyStatements();
+        await repo.setAppSetting('requeue_false_empty_v452', 'true');
+        if (n > 0) debugPrint('♻️ Re-opened $n statement(s) closed as already-imported');
+      }
+    } catch (e) {
+      debugPrint('requeue_false_empty_v452 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {
