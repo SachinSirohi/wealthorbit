@@ -263,7 +263,9 @@ Return ONE JSON object, no markdown:
 
 Each transaction is a 5-element ARRAY, not an object:
   date   "YYYY-MM-DD"
-  desc   short description (max 40 chars)
+  desc   the narration, up to 90 chars. Keep BOTH sides of an internal
+         transfer ("<name> to Fixed Saving Space") — truncating it hides
+         which savings pot the money went to
   amount positive number, never negative
   kind   "e" for debit/withdrawal/purchase, "i" for credit/deposit/refund/salary
 ${isCreditCard ? '''
@@ -279,6 +281,7 @@ IMPORTANT — this is a CREDIT CARD statement:
 Rules:
 1. Every debit is kind "e"; every credit is kind "i". Amounts stay positive.
 2. "cb" is the statement's closing/final balance, or null if not stated.
+   On a credit card statement that is the total amount due / total to pay.
 3. "cur" is the statement currency (INR, AED, USD...), from the header.
 4. Include EVERY transaction line. Do not summarise or omit any.
 5. Output JSON only. No markdown, no commentary.

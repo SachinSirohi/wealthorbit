@@ -128,6 +128,15 @@ void main() async {
     } catch (e) {
       debugPrint('retypeBrokerageAccounts skipped: $e');
     }
+    // Anchoring sets opening = closing - effects at the moment it runs, and
+    // statements imported afterwards move the balance away from the figure
+    // the bank reported. Re-deriving it every launch keeps each account on
+    // the number its own statement last stated.
+    try {
+      await repo.reapplyAnchors();
+    } catch (e) {
+      debugPrint('reapplyAnchors skipped: $e');
+    }
 
     // One-shot (v4.1.0): repair the statement pipeline.
     //  * accounts the old loose card heuristic flipped to credit_card (and
@@ -306,6 +315,25 @@ void main() async {
       }
     } catch (e) {
       debugPrint('kind_markers_rebuild_v490 skipped: $e');
+    }
+
+    // One-shot (v4.10.0): narrations were capped at 40 characters, which cut
+    // the pot name off the FUNDING side of a savings transfer — so deposits
+    // read as spending while withdrawals were recognised, and a fixed
+    // deposit showed a large negative balance. Also re-runs source mapping,
+    // since splitting Emirates NBD left other banks' senders pointing at it.
+    try {
+      if (!await repo.getBoolSetting('narration_rebuild_v4100')) {
+        await repo.unmapMisroutedSources();
+        await repo.autoMapUnmappedSources();
+        final superseded = await repo.quarantineAllStatementTransactions();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('narration_rebuild_v4100', 'true');
+        debugPrint('📝 Narration rebuild: $superseded row(s) set aside, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('narration_rebuild_v4100 skipped: $e');
     }
 
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)

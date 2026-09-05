@@ -1726,6 +1726,18 @@ class AppRepository {
     return target?.id ?? accountId;
   }
 
+  /// Detach a source whose statements are in a different currency from the
+  /// account they are aimed at. The import already refuses these; leaving
+  /// the mapping in place means it refuses them again on every sync.
+  Future<void> unmapSourceOnCurrencyClash(String sourceId) async {
+    final source = await getStatementSource(sourceId);
+    if (source == null || source.accountId == null) return;
+    await updateStatementSource(
+        sourceId, const StatementSourcesCompanion(accountId: Value(null)));
+    debugPrint('🔀 Unmapped ${source.bankName} — its statements are in '
+        'another currency than the account it pointed at');
+  }
+
   /// Give every unmapped source the account its statements belong in,
   /// creating that account when it does not exist yet.
   ///
@@ -2709,6 +2721,30 @@ class AppRepository {
     await (_db.update(_db.accounts)..where((a) => a.id.equals(accountId)))
       .write(AccountsCompanion(openingBalance: Value(newOpening)));
     await recomputeAccountBalance(accountId);
+  }
+
+  /// Re-apply each account's newest known closing balance.
+  ///
+  /// Anchoring sets `opening = closing - effects` at the moment it runs.
+  /// The queue drains newest-first, so the newest statement anchors and
+  /// THEN older statements import their transactions — every one of which
+  /// moves the balance away from the figure the bank actually reported.
+  /// After a drain the anchor has to be re-derived, or an account ends up
+  /// arbitrarily far from the truth: HDFC's card read minus ₹87 lakh while
+  /// still claiming to be anchored.
+  Future<int> reapplyAnchors() async {
+    int n = 0;
+    for (final account in await getAllAccounts()) {
+      final info = await getAnchorInfo(account.id);
+      if (info == null) continue;
+      // applyClosingBalance re-signs for cards, so hand it the magnitude
+      // the bank stated rather than the stored, already-signed value.
+      final stated = account.type == 'credit_card' ? info.closing.abs() : info.closing;
+      await applyClosingBalance(account.id, stated, statementDate: info.date);
+      n++;
+    }
+    if (n > 0) debugPrint('⚓ Re-anchored $n account(s) to their stated balances');
+    return n;
   }
 
   /// What the bank last said about an account, and how much of it the

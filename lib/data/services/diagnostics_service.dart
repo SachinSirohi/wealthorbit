@@ -126,6 +126,17 @@ class DiagnosticsService {
       ..sort((a, b) => b.amountBase.compareTo(a.amountBase));
     final accountNames = {for (final a in accounts) a.id: a.name};
 
+    // Savings-pot movements, to check both directions are recognised. Only
+    // withdrawals were, because the narration was truncated before the pot
+    // name on the funding side.
+    final potRows = all
+        .where((t) =>
+            !kHiddenStatuses.contains(t.status) &&
+            RegExp(r'saving|space|vault', caseSensitive: false)
+                .hasMatch(t.description))
+        .toList()
+      ..sort((a, b) => b.transactionDate.compareTo(a.transactionDate));
+
     // ── Sources ─────────────────────────────────────────────────────────
     final sources = await repo.getAllStatementSources();
     final sourceRows = <Map<String, dynamic>>[];
@@ -193,6 +204,18 @@ class DiagnosticsService {
           for (final e in topFailures.take(14)) e.key: e.value,
         },
       },
+      'savings_rows': [
+        for (final t in potRows.take(14))
+          {
+            'date': t.transactionDate.toIso8601String().split('T').first,
+            'account': accountNames[t.accountId],
+            'to': t.transferAccountId == null ? null : accountNames[t.transferAccountId],
+            'type': t.type,
+            'class': t.txnClass,
+            'amount': _r(t.amountSource),
+            'description': t.description,
+          },
+      ],
       'recent_income': [
         for (final t in incomeRows.take(20))
           {

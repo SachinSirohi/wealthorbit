@@ -412,6 +412,11 @@ Future<void> _processStatementQueue({
               // instead of vanishing into the completed pile.
               await repository.updateStatementQueueStatus(item.id, 'empty',
                   errorMessage: emptyReason ?? 'No transactions were imported.');
+              if ((emptyReason ?? '').contains('is a') &&
+                  (emptyReason ?? '').contains('account') &&
+                  sourceId != null) {
+                await repository.unmapSourceOnCurrencyClash(sourceId);
+              }
               emptied++;
               noteReason(emptyReason ?? 'nothing to import');
               debugPrint('⚪️ Queue item ${item.subject} → 0 txns · $emptyReason');
@@ -445,6 +450,19 @@ Future<void> _processStatementQueue({
       }
 
       if (completed + emptied + failed > 0) {
+        try {
+          // Older statements imported after the newest one anchored have
+          // moved every balance away from what the bank actually said.
+          await repository.reapplyAnchors();
+        } catch (e) {
+          debugPrint('Re-anchor after drain failed: $e');
+        }
+        try {
+          onProgress?.call('Categorising…');
+          await repository.autoCategoriseUncategorised();
+        } catch (e) {
+          debugPrint('Auto-categorise after drain failed: $e');
+        }
         try {
           onProgress?.call('Matching transfers…');
           final recon = await ReconciliationService(repository).run();
