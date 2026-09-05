@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'secure_vault.dart';
+import 'llm_router.dart';
 
 /// OpenAI-compatible client pointed at the WealthOrbit LLM
 /// (`https://llm.edgenroots.org`, model `qwen-14b`).
@@ -68,16 +69,17 @@ class GeminiService {
 
   /// Write the built-in key if none is stored, or if the stored key is a
   /// leftover Google Gemini key (`AIza…`) that this build no longer uses.
+  /// Seed the built-in Qwen key so the FALLBACK engine works out of the box.
+  ///
+  /// This used to write into the single shared key slot and treated anything
+  /// starting with `AIza` as stale — so supplying a Google key deleted it on
+  /// the next launch, which is why Gemini could never be the primary engine.
+  /// It now only ever touches the Qwen slot.
   static Future<void> seedDefaultKey() async {
-    // Nothing to seed in a build without a baked-in key: leave whatever the
-    // user configured alone rather than overwriting it with an empty string.
     if (defaultApiKey.isEmpty) return;
-    final existing = await SecureVault.getGeminiApiKey();
-    if (existing == null ||
-        existing.isEmpty ||
-        existing.startsWith('AIza') ||
-        existing == 'demo-key-not-real') {
-      await SecureVault.setGeminiApiKey(defaultApiKey);
+    final existing = await SecureVault.getQwenApiKey();
+    if (existing == null || existing.isEmpty || existing == 'demo-key-not-real') {
+      await SecureVault.setQwenApiKey(defaultApiKey);
     }
   }
 
@@ -85,18 +87,66 @@ class GeminiService {
   /// must not stall on a health-check).
   static Future<bool> initialize() async {
     await seedDefaultKey();
-    final apiKey = await SecureVault.getGeminiApiKey();
-    _ready = apiKey != null && apiKey.isNotEmpty;
+    // Ready if EITHER engine can answer: Gemini is tried first, Qwen backs
+    // up any call it cannot serve.
+    _ready = await SecureVault.hasAnyLlmKey();
     return _ready;
   }
 
+  /// Which engine served the last request, for diagnostics and the UI.
+  static String get activeEngine {
+    final p = LlmRouter.lastProvider;
+    if (p == null) return 'not used yet';
+    return p == LlmProvider.gemini
+        ? 'Gemini (${LlmRouter.lastModel ?? "flash"})'
+        : 'Qwen (fallback)';
+  }
+
   /// Check if the API key is valid. Returns null if valid, or an error message.
+  /// Check a key and store it in the right slot. A Google key (`AIza…`)
+  /// becomes the primary engine; anything else is treated as a Qwen key.
+  static Future<String?> validateAndStoreKey(String apiKey) async {
+    final key = apiKey.trim();
+    if (key.length < 8) return 'Key is too short';
+
+    if (SecureVault.looksLikeGeminiKey(key)) {
+      final error = await _validateGeminiKey(key);
+      if (error != null) return error;
+      await SecureVault.setGeminiApiKey(key);
+      return null;
+    }
+
+    final error = await validateApiKey(key);
+    if (error != null) return error;
+    await SecureVault.setQwenApiKey(key);
+    return null;
+  }
+
+  /// Ask Google to list models — the cheapest proof a key works, and it
+  /// costs nothing against the generation quota.
+  static Future<String?> _validateGeminiKey(String apiKey) async {
+    try {
+      final res = await http.get(
+        Uri.parse('https://generativelanguage.googleapis.com/v1beta/models'),
+        headers: {'x-goog-api-key': apiKey},
+      ).timeout(const Duration(seconds: 20));
+      if (res.statusCode == 200) return null;
+      if (res.statusCode == 400 || res.statusCode == 403) {
+        return 'Google rejected this key. Check it was copied in full and '
+            'that the Generative Language API is enabled for it.';
+      }
+      return 'Google returned HTTP ${res.statusCode}: ${_shortError(res.body)}';
+    } catch (e) {
+      return 'Could not reach Google: ${_shortError(e)}';
+    }
+  }
+
   static Future<String?> validateApiKey(String apiKey) async {
     if (apiKey.isEmpty || apiKey.length < 8) {
       return 'Key is too short';
     }
     try {
-      final text = await _complete(
+      final text = await _completeQwen(
         apiKey: apiKey,
         user: 'Reply with the single word PONG',
         jsonMode: false,
@@ -676,6 +726,8 @@ Rules:
     return true;
   }
 
+  /// Every completion in the app goes through here: Gemini first, Qwen as
+  /// the fallback for any single call Gemini cannot serve.
   static Future<String> _complete({
     String? apiKey,
     required String user,
@@ -684,9 +736,46 @@ Rules:
     int maxTokens = 2048,
     Duration timeout = const Duration(seconds: 120),
   }) async {
-    final key = apiKey ?? await SecureVault.getGeminiApiKey();
+    final system = jsonMode
+        ? 'You are a JSON generator. Reply with a single valid JSON value and '
+            'nothing else. No markdown fences. No commentary.'
+        : 'Answer directly and concisely.';
+
+    return LlmRouter.complete(
+      system: system,
+      user: user,
+      jsonMode: jsonMode,
+      temperature: temperature,
+      maxTokens: maxTokens,
+      // Gemini is far quicker than the self-hosted model; it does not need
+      // the long ceiling Qwen's generation rate forces.
+      timeout: timeout > const Duration(seconds: 90)
+          ? const Duration(seconds: 90)
+          : timeout,
+      qwenFallback: () => _completeQwen(
+        apiKey: apiKey,
+        user: user,
+        jsonMode: jsonMode,
+        temperature: temperature,
+        maxTokens: maxTokens,
+        timeout: timeout,
+      ),
+    );
+  }
+
+  /// The self-hosted OpenAI-compatible engine. Kept exactly as it was —
+  /// thinking disabled, one retry on a gateway timeout.
+  static Future<String> _completeQwen({
+    String? apiKey,
+    required String user,
+    required bool jsonMode,
+    double temperature = 0.2,
+    int maxTokens = 2048,
+    Duration timeout = const Duration(seconds: 120),
+  }) async {
+    final key = apiKey ?? await SecureVault.getQwenApiKey();
     if (key == null || key.isEmpty) {
-      throw Exception('No AI API key configured');
+      throw Exception('No fallback AI key configured');
     }
 
     final system = jsonMode

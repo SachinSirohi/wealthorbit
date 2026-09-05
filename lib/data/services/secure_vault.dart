@@ -30,7 +30,11 @@ class SecureVault {
   );
 
   // Keys
-  static const _geminiApiKey = 'gemini_api_key';
+  // Two engines, two slots. They shared one until 4.4.0, and because the
+  // qwen key was seeded over anything starting with `AIza`, storing a Google
+  // key simply deleted it on the next launch.
+  static const _geminiApiKey = 'gemini_api_key';   // Google, "AIza..."
+  static const _qwenApiKey = 'qwen_api_key';       // self-hosted, "sk-...
   static const _baseCurrency = 'base_currency';
   static const _onboardingComplete = 'onboarding_complete';
 
@@ -38,21 +42,51 @@ class SecureVault {
   // GEMINI API KEY
   // ═══════════════════════════════════════════════════════════════════════════
   
-  /// Store the user's Gemini API key
+  /// Store the user's Google Gemini API key (the primary engine).
   static Future<void> setGeminiApiKey(String key) async {
-    await _storage.write(key: _geminiApiKey, value: key);
+    await _storage.write(key: _geminiApiKey, value: key.trim());
   }
-  
-  /// Get the stored Gemini API key
+
+  /// The Google Gemini key, or null when the user has not supplied one.
+  /// Never returns a Qwen key that landed in this slot before the two were
+  /// separated — that would be sent to Google and rejected.
   static Future<String?> getGeminiApiKey() async {
-    return await _storage.read(key: _geminiApiKey);
+    final key = (await _storage.read(key: _geminiApiKey))?.trim();
+    if (key == null || key.isEmpty) return null;
+    return looksLikeGeminiKey(key) ? key : null;
   }
-  
-  /// Check if Gemini API key is configured
-  static Future<bool> hasGeminiApiKey() async {
-    final key = await _storage.read(key: _geminiApiKey);
-    return key != null && key.isNotEmpty;
+
+  static Future<bool> hasGeminiApiKey() async =>
+      (await getGeminiApiKey()) != null;
+
+  /// Store the self-hosted Qwen key (the fallback engine).
+  static Future<void> setQwenApiKey(String key) async {
+    await _storage.write(key: _qwenApiKey, value: key.trim());
   }
+
+  static Future<String?> getQwenApiKey() async {
+    final key = (await _storage.read(key: _qwenApiKey))?.trim();
+    if (key != null && key.isNotEmpty) return key;
+    // Migration: before the slots were separated the Qwen key lived here.
+    final legacy = (await _storage.read(key: _geminiApiKey))?.trim();
+    if (legacy != null && legacy.isNotEmpty && !looksLikeGeminiKey(legacy)) {
+      await setQwenApiKey(legacy);
+      return legacy;
+    }
+    return null;
+  }
+
+  static Future<bool> hasQwenApiKey() async =>
+      (await getQwenApiKey()) != null;
+
+  /// Google API keys are `AIza` followed by 35 URL-safe characters. Used to
+  /// tell the two engines' keys apart and to keep each in its own slot.
+  static bool looksLikeGeminiKey(String key) =>
+      RegExp(r'^AIza[0-9A-Za-z_-]{30,}$').hasMatch(key.trim());
+
+  /// True once either engine can answer.
+  static Future<bool> hasAnyLlmKey() async =>
+      await hasGeminiApiKey() || await hasQwenApiKey();
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PDF PASSWORDS (Per Bank)
@@ -149,8 +183,8 @@ class SecureVault {
   // Check onboarding completion
   static Future<bool> isOnboardingComplete() async {
     final currency = await _storage.read(key: _baseCurrency);
-    final apiKey = await _storage.read(key: _geminiApiKey);
-    return currency != null && apiKey != null;
+    // Either engine counts — the app is usable on the fallback alone.
+    return currency != null && await hasAnyLlmKey();
   }
   
   // ── Email accounts (IMAP) — supports MULTIPLE accounts ────────────────────

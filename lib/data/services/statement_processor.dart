@@ -54,8 +54,8 @@ class StatementProcessor {
   /// Returns null on success, or a user-facing error message.
   static Future<String?> ensureGeminiReady() async {
     await GeminiService.seedDefaultKey();
-    if (!await SecureVault.hasGeminiApiKey()) {
-      return 'Add your AI API key in Settings to extract statements.';
+    if (!await SecureVault.hasAnyLlmKey()) {
+      return 'Add an AI API key in Settings to extract statements.';
     }
     final ok = await GeminiService.initialize();
     return ok ? null : 'Could not initialize AI. Check your API key and connection.';

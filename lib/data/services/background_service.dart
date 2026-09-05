@@ -167,7 +167,7 @@ Future<void> _processStatementQueue({
     }
 
     await GeminiService.seedDefaultKey();
-    if (!await SecureVault.hasGeminiApiKey()) {
+    if (!await SecureVault.hasAnyLlmKey()) {
       debugPrint('🤖 AI API key not configured, skipping statement processing');
       return;
     }

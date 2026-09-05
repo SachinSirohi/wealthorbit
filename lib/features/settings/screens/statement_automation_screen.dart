@@ -799,13 +799,21 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     );
   }
 
+  /// Which engines are configured. Gemini leads and Qwen backs it up, so
+  /// both matter to what this card should say.
+  Future<({bool any, bool gemini})> _llmKeyState() async => (
+        any: await SecureVault.hasAnyLlmKey(),
+        gemini: await SecureVault.hasGeminiApiKey(),
+      );
+
   /// AI engine status + key management. Extraction can't run without a key,
   /// so its state must be visible at a glance.
   Widget _buildGeminiCard() {
-    return FutureBuilder<bool>(
-      future: SecureVault.hasGeminiApiKey(),
+    return FutureBuilder<({bool any, bool gemini})>(
+      future: _llmKeyState(),
       builder: (context, snap) {
-        final configured = snap.data ?? false;
+        final configured = snap.data?.any ?? false;
+        final hasGemini = snap.data?.gemini ?? false;
         return InkWell(
           onTap: _showGeminiKeyDialog,
           borderRadius: BorderRadius.circular(WoRadius.card),
@@ -826,11 +834,19 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                     children: [
                       Text('WealthOrbit AI', style: WoText.subtitle()),
                       Text(
-                        configured
-                            ? 'qwen-14b · extraction enabled'
-                            : 'No API key — statements cannot be extracted. Tap to add.',
+                        !configured
+                            ? 'No API key — statements cannot be extracted. Tap to add.'
+                            : hasGemini
+                                // Gemini leads; Qwen only picks up calls it
+                                // cannot serve, one at a time.
+                                ? 'Gemini · Qwen fallback · ${GeminiService.activeEngine} last'
+                                : 'qwen-14b only — add a Gemini key for faster extraction',
                         style: GoogleFonts.inter(
-                          color: configured ? WoColors.textMid : WoColors.orange,
+                          color: !configured
+                              ? WoColors.orange
+                              : hasGemini
+                                  ? WoColors.textMid
+                                  : WoColors.gold,
                           fontSize: 12,
                         ),
                       ),
@@ -898,7 +914,10 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                         validating = true;
                         error = null;
                       });
-                      final validationError = await GeminiService.validateApiKey(key);
+                      // Stores a Google key as the primary engine and any
+                      // other key as the Qwen fallback.
+                      final validationError =
+                          await GeminiService.validateAndStoreKey(key);
                       if (validationError != null) {
                         setDialogState(() {
                           validating = false;
@@ -906,7 +925,6 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
                         });
                         return;
                       }
-                      await SecureVault.setGeminiApiKey(key);
                       if (ctx.mounted) Navigator.pop(ctx);
                       if (mounted) setState(() {});
                     },

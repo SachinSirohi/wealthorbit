@@ -14,7 +14,7 @@ class DemoDataService {
 
     await SecureVault.setOnboardingComplete(true);
     await SecureVault.setBaseCurrency('AED');
-    await SecureVault.setGeminiApiKey('demo-key-not-real');
+    await SecureVault.setQwenApiKey('demo-key-not-real');
     await SecureVault.addEmailAccount('demo@wealthorbit.app', 'demo', 'gmail');
 
     const inr = 0.0441; // → AED

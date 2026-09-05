@@ -2,6 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:wealth_orbit/core/amount_sanity.dart';
 import 'package:wealth_orbit/core/statement_date.dart';
 import 'package:wealth_orbit/core/merchant_rules.dart';
+import 'package:wealth_orbit/data/services/llm_router.dart';
+import 'package:wealth_orbit/data/services/secure_vault.dart';
 import 'package:wealth_orbit/core/utils/currency_utils.dart';
 import 'package:wealth_orbit/data/repositories/app_repository.dart';
 import 'package:wealth_orbit/data/services/statement_processor.dart';
@@ -326,6 +328,95 @@ void main() {
     test('does not confuse Emirates the airline with Emirates NBD the bank', () {
       expect(cat('EMIRATES NBD ATM'), isNot('cat_travel'));
       expect(cat('EMIRATES AIRLINE TICKET'), 'cat_travel');
+    });
+  });
+
+  group('LlmRouter model rotation', () {
+    setUp(LlmRouter.reset);
+
+    test('starts on the strongest free-tier model', () {
+      expect(LlmRouter.nextAvailableModel(), 'gemini-2.5-flash');
+    });
+
+    test('rotates to the next model when one is out of quota', () {
+      final now = DateTime(2026, 9, 5, 12);
+      LlmRouter.markExhausted('gemini-2.5-flash', now: now);
+      expect(LlmRouter.nextAvailableModel(now: now), 'gemini-2.0-flash');
+    });
+
+    test('returns null only once every model is resting', () {
+      final now = DateTime(2026, 9, 5, 12);
+      for (final m in LlmRouter.geminiModels) {
+        LlmRouter.markExhausted(m, now: now);
+      }
+      expect(LlmRouter.nextAvailableModel(now: now), isNull);
+    });
+
+    test('a rested model comes back into rotation', () {
+      final now = DateTime(2026, 9, 5, 12);
+      LlmRouter.markExhausted('gemini-2.5-flash',
+          retryAfter: const Duration(seconds: 30), now: now);
+      expect(LlmRouter.nextAvailableModel(now: now), 'gemini-2.0-flash');
+      final later = now.add(const Duration(seconds: 31));
+      expect(LlmRouter.nextAvailableModel(now: later), 'gemini-2.5-flash');
+    });
+
+    test('honours a retry delay named by the API', () {
+      const body = '{"error":{"code":429,"details":[{"retryDelay":"37s"}]}}';
+      expect(LlmRouter.parseRetryDelay(body), const Duration(seconds: 37));
+      expect(LlmRouter.parseRetryDelay('{"error":{}}'), isNull);
+    });
+
+    test('tells quota trouble apart from a bad key', () {
+      // Worth rotating to another model...
+      expect(LlmRouter.isQuotaFailure(429, 'rate limit exceeded'), isTrue);
+      expect(LlmRouter.isQuotaFailure(200, 'RESOURCE_EXHAUSTED'), isTrue);
+      // ...and not worth it: these fail the same way on every model.
+      expect(LlmRouter.isQuotaFailure(400, 'API key not valid'), isFalse);
+      expect(LlmRouter.isQuotaFailure(403, 'permission denied'), isFalse);
+      expect(LlmRouter.isQuotaFailure(500, 'internal'), isFalse);
+    });
+  });
+
+  group('LlmRouter.extractText', () {
+    test('reads the answer out of a normal response', () {
+      const body = '{"candidates":[{"content":{"parts":[{"text":"{\\"t\\":[]}"}]}}]}';
+      expect(LlmRouter.extractText(body), '{"t":[]}');
+    });
+
+    test('joins multi-part answers', () {
+      const body =
+          '{"candidates":[{"content":{"parts":[{"text":"ab"},{"text":"cd"}]}}]}';
+      expect(LlmRouter.extractText(body), 'abcd');
+    });
+
+    test('surfaces the finish reason when there is no text', () {
+      const body = '{"candidates":[{"finishReason":"MAX_TOKENS","content":{}}]}';
+      expect(() => LlmRouter.extractText(body),
+          throwsA(predicate((e) => e.toString().contains('MAX_TOKENS'))));
+    });
+
+    test('surfaces a blocked prompt', () {
+      const body = '{"candidates":[],"promptFeedback":{"blockReason":"SAFETY"}}';
+      expect(() => LlmRouter.extractText(body),
+          throwsA(predicate((e) => e.toString().contains('SAFETY'))));
+    });
+  });
+
+  group('SecureVault.looksLikeGeminiKey', () {
+    test('recognises a Google key', () {
+      expect(
+        SecureVault.looksLikeGeminiKey('AIzaSyD-ExampleKeyMaterial_1234567890abc'),
+        isTrue,
+      );
+    });
+
+    test('does not mistake the Qwen key for one', () {
+      // The two shared a slot until 4.4.0; telling them apart is what stops
+      // a Qwen key being sent to Google and a Google key being overwritten.
+      expect(SecureVault.looksLikeGeminiKey('sk-Z4lhkfYqsHh489KuLnNjMw'), isFalse);
+      expect(SecureVault.looksLikeGeminiKey('AIza-too-short'), isFalse);
+      expect(SecureVault.looksLikeGeminiKey(''), isFalse);
     });
   });
 }

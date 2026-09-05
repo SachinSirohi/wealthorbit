@@ -391,7 +391,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     setState(() => _keyError = 'Validate the custom key first, or clear the field to use the built-in key.');
                     return;
                   }
-                  await SecureVault.setGeminiApiKey(typed);
+                  // validateAndStoreKey already filed it in the right slot.
                 } else {
                   await GeminiService.seedDefaultKey();
                 }
@@ -755,7 +755,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     
     try {
       // Returns null if valid, or error message string if invalid
-      final errorMsg = await GeminiService.validateApiKey(key);
+      final errorMsg = await GeminiService.validateAndStoreKey(key);
       setState(() {
         _isValidatingKey = false;
         if (errorMsg == null) {
