@@ -866,78 +866,177 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     );
   }
 
+  /// Both engines, each with its own field.
+  ///
+  /// This was a single unlabelled "AI API Key" box whose description named
+  /// only qwen-14b. Pasting a Google key did the right thing — keys are
+  /// filed by shape — but nothing said so, so there was no way to discover
+  /// that Gemini could be configured at all.
   Future<void> _showGeminiKeyDialog() async {
-    final controller = TextEditingController(text: await SecureVault.getGeminiApiKey() ?? '');
+    final geminiController =
+        TextEditingController(text: await SecureVault.getGeminiApiKey() ?? '');
+    final qwenController =
+        TextEditingController(text: await SecureVault.getQwenApiKey() ?? '');
     if (!mounted) return;
-    bool validating = false;
+
+    bool saving = false;
     String? error;
-    await showDialog<void>(
+
+    await showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          backgroundColor: WoColors.surface,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
-          title: Text('AI API Key', style: WoText.title()),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Used to read statement PDFs via qwen-14b. A built-in key is already configured; paste a replacement only if you need to rotate it.',
-                style: WoText.caption(),
-              ),
-              const SizedBox(height: 14),
-              TextField(
-                controller: controller,
-                obscureText: true,
-                style: GoogleFonts.inter(color: WoColors.textHi),
-                decoration: woInput('API key'),
-              ),
-              if (error != null) ...[
-                const SizedBox(height: 10),
-                Text(error!, style: GoogleFonts.inter(color: WoColors.red, fontSize: 12)),
+        builder: (ctx, setSheetState) => Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+          child: WoSheet(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('AI engines', style: WoText.title()),
+                const SizedBox(height: 6),
+                Text(
+                  'Statements are read by Gemini first. Qwen picks up any '
+                  'single request Gemini cannot serve, then the next one goes '
+                  'back to Gemini.',
+                  style: WoText.caption(),
+                ),
+                const SizedBox(height: 20),
+
+                _engineField(
+                  label: 'Gemini · primary',
+                  hint: 'AIza…',
+                  controller: geminiController,
+                  blurb: 'Faster and more accurate. Free key from '
+                      'aistudio.google.com/apikey — the free tier is enough; '
+                      'the app paces requests and rotates models to stay in it.',
+                  accent: WoColors.gold,
+                ),
+                const SizedBox(height: 18),
+                _engineField(
+                  label: 'Qwen · fallback',
+                  hint: 'sk-…',
+                  controller: qwenController,
+                  blurb: 'Self-hosted, slower, no quota. Used only when '
+                      'Gemini is rate-limited or unreachable.',
+                  accent: WoColors.indigo,
+                ),
+
+                if (error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(error!,
+                      style: GoogleFonts.inter(color: WoColors.red, fontSize: 12)),
+                ],
+                const SizedBox(height: 22),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    style: WoButtons.primary,
+                    onPressed: saving
+                        ? null
+                        : () async {
+                            setSheetState(() {
+                              saving = true;
+                              error = null;
+                            });
+                            final problem = await _saveEngineKeys(
+                              gemini: geminiController.text.trim(),
+                              qwen: qwenController.text.trim(),
+                            );
+                            if (problem != null) {
+                              setSheetState(() {
+                                saving = false;
+                                error = problem;
+                              });
+                              return;
+                            }
+                            if (ctx.mounted) Navigator.pop(ctx);
+                            if (mounted) setState(() {});
+                          },
+                    child: saving
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: Colors.black))
+                        : const Text('Validate & save'),
+                  ),
+                ),
               ],
-            ],
+            ),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: Text('Cancel', style: GoogleFonts.poppins(color: WoColors.textMid)),
-            ),
-            ElevatedButton(
-              onPressed: validating
-                  ? null
-                  : () async {
-                      final key = controller.text.trim();
-                      if (key.isEmpty) return;
-                      setDialogState(() {
-                        validating = true;
-                        error = null;
-                      });
-                      // Stores a Google key as the primary engine and any
-                      // other key as the Qwen fallback.
-                      final validationError =
-                          await GeminiService.validateAndStoreKey(key);
-                      if (validationError != null) {
-                        setDialogState(() {
-                          validating = false;
-                          error = validationError.split('\n').first;
-                        });
-                        return;
-                      }
-                      if (ctx.mounted) Navigator.pop(ctx);
-                      if (mounted) setState(() {});
-                    },
-              style: WoButtons.primary,
-              child: validating
-                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
-                  : const Text('Validate & Save'),
-            ),
-          ],
         ),
       ),
     );
   }
+
+  Widget _engineField({
+    required String label,
+    required String hint,
+    required TextEditingController controller,
+    required String blurb,
+    required Color accent,
+  }) {
+    final configured = controller.text.trim().isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 3,
+              height: 14,
+              decoration: BoxDecoration(
+                  color: accent, borderRadius: BorderRadius.circular(2)),
+            ),
+            const SizedBox(width: 8),
+            Text(label, style: WoText.subtitle()),
+            const SizedBox(width: 8),
+            WoChip(configured ? 'Set' : 'Not set',
+                color: configured ? WoColors.mint : WoColors.textLo),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(blurb, style: WoText.caption(color: WoColors.textLo)),
+        const SizedBox(height: 8),
+        TextField(
+          controller: controller,
+          obscureText: true,
+          style: GoogleFonts.inter(color: WoColors.textHi),
+          decoration: woInput(hint),
+        ),
+      ],
+    );
+  }
+
+  /// Validate whichever keys were supplied and store each in its own slot.
+  /// An empty field clears nothing — it just means "leave this engine as is".
+  Future<String?> _saveEngineKeys({
+    required String gemini,
+    required String qwen,
+  }) async {
+    if (gemini.isEmpty && qwen.isEmpty) {
+      return 'Enter at least one key.';
+    }
+    if (gemini.isNotEmpty) {
+      if (!SecureVault.looksLikeGeminiKey(gemini)) {
+        return 'That does not look like a Google API key — they start with '
+            '"AIza". Paste a Qwen key in the field below instead.';
+      }
+      final problem = await GeminiService.validateAndStoreKey(gemini);
+      if (problem != null) return problem.split('\n').first;
+    }
+    if (qwen.isNotEmpty) {
+      if (SecureVault.looksLikeGeminiKey(qwen)) {
+        return 'That is a Google key — put it in the Gemini field above.';
+      }
+      final problem = await GeminiService.validateAndStoreKey(qwen);
+      if (problem != null) return problem.split('\n').first;
+    }
+    return null;
+  }
+
 
   /// View/update the PDF password used to open this source's statements.
   Future<void> _showPdfPasswordDialog(StatementSource source) async {
