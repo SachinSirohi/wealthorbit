@@ -6,6 +6,7 @@ import '../../core/utils/currency_utils.dart';
 import '../../core/amount_sanity.dart';
 import '../../core/merchant_rules.dart';
 import '../../core/savings_space.dart';
+import '../models/discovered_source.dart';
 import '../services/statement_processor.dart' show isBrokerageSender;
 
 /// Status marking the counter-leg of a matched transfer.
@@ -226,11 +227,22 @@ class AppRepository {
   }
 
   Future<bool> isBalanceUntrustworthy(Account a) async {
-    if (a.type == 'credit_card' || a.type == 'brokerage') return false;
-    if (a.balance >= 0) return false;
-    final anchored = await getAppSetting('anchor_closing_${a.id}') ??
-        await getAppSetting('closing_date_${a.id}');
-    return anchored == null;
+    if (a.type == 'brokerage') return false;
+    // A pot's balance is inferred from its own movements rather than
+    // anchored by a statement, and the inference guarantees it is never
+    // negative, so the "never anchored" test does not apply.
+    if (isSavingsPotAccount(a)) return false;
+
+    final anchored = (await getAppSetting('anchor_closing_${a.id}')) ??
+        (await getAppSetting('closing_date_${a.id}'));
+    if (anchored != null) return false;
+
+    // A card carrying debt no statement has ever confirmed is a running
+    // total of spending with the repayments missing — the same partial
+    // ledger as an unanchored bank account in overdraft, and just as
+    // misleading in a total. Emirates NBD's card sat at -110,258 this way.
+    if (a.type == 'credit_card') return a.balance < 0;
+    return a.balance < 0;
   }
 
   /// Accounts whose balance the app cannot vouch for, worst first.
@@ -267,7 +279,11 @@ class AppRepository {
     double total = 0.0;
     for (final a in accounts) {
       if (a.type != 'credit_card') continue;
-      if (a.balance < 0) total += -a.balance * (rates[a.currencyCode] ?? 1.0);
+      if (a.balance >= 0) continue;
+      // Debt no statement has confirmed is spending with the repayments
+      // missing; it is surfaced on Data Health rather than added here.
+      if (await isBalanceUntrustworthy(a)) continue;
+      total += -a.balance * (rates[a.currencyCode] ?? 1.0);
     }
     return total;
   }
@@ -1726,6 +1742,27 @@ class AppRepository {
     return target?.id ?? accountId;
   }
 
+  /// Re-derive the institution for sources recorded as unknown.
+  ///
+  /// An unknown bank is never unmapped — there is no way to tell where it
+  /// belongs — so every unidentified sender kept pointing at whichever
+  /// account it had been handed years ago. Naming them from the sending
+  /// domain lets the ordinary mapping rules take over.
+  Future<int> renameUnknownSources() async {
+    int n = 0;
+    for (final source in await getAllStatementSources()) {
+      final current = source.bankName.trim().toLowerCase();
+      if (current != 'unknown bank' && current != 'unknown source') continue;
+      final guessed = DiscoveredSource.guessNameFromEmail(source.senderEmail);
+      if (guessed.toLowerCase().startsWith('unknown')) continue;
+      await updateStatementSource(
+          source.id, StatementSourcesCompanion(bankName: Value(guessed)));
+      n++;
+      debugPrint('🏷️ ${source.senderEmail} identified as "$guessed"');
+    }
+    return n;
+  }
+
   /// Detach a source whose statements are in a different currency from the
   /// account they are aimed at. The import already refuses these; leaving
   /// the mapping in place means it refuses them again on every sync.
@@ -2665,7 +2702,7 @@ class AppRepository {
   /// For CREDIT CARDS the statement "closing balance" is the amount DUE —
   /// stored as a negative balance (debt).
   Future<void> applyClosingBalance(String accountId, double closing,
-      {DateTime? statementDate}) async {
+      {DateTime? statementDate, String? statementId}) async {
     // Only the NEWEST statement should set an account's balance. When several
     // statements for one account are processed out of order, an older one used
     // to overwrite a newer one (leaving a stale/0 balance). Gate by the
@@ -2714,6 +2751,14 @@ class AppRepository {
     final newOpening = closing - effects;
     final drift = hadPreviousAnchor ? newOpening - (account?.openingBalance ?? 0) : 0.0;
     await setAppSetting('anchor_closing_$accountId', closing.toString());
+    // Remember WHICH statement said this. An anchor written while a
+    // statement was routed to the wrong account otherwise persists for
+    // ever — Deem's card and Emirates NBD's card both sat on -7,786.93
+    // from the same document, and re-anchoring faithfully restored it
+    // every launch.
+    if (statementId != null) {
+      await setAppSetting('anchor_stmt_$accountId', statementId);
+    }
     await setAppSetting('anchor_drift_$accountId', drift.toString());
     if (statementDate != null) {
       await setAppSetting('anchor_date_$accountId', statementDate.toIso8601String());
@@ -2757,6 +2802,59 @@ class AppRepository {
     );
   }
 
+  /// Accounts that stand for a savings pot rather than a real bank account.
+  static bool isSavingsPotAccount(Account a) => a.id.startsWith('acct_pot_');
+
+  /// Give each savings pot an opening balance that keeps it from ever going
+  /// negative.
+  ///
+  /// A pot only appears in a statement when money moves in or out of it, so
+  /// whatever was already parked there before the imported window is
+  /// invisible. Wio's fixed deposit showed seven withdrawals against one
+  /// deposit and settled at minus 421,000 — but you cannot withdraw from a
+  /// pot you never funded, so the balance before the window must have been
+  /// at least the deepest drawdown. Setting the opening balance to exactly
+  /// that puts the low point at zero: the smallest figure consistent with
+  /// the movements on record, and never an invented surplus.
+  ///
+  /// A real statement for the pot would beat this; nothing issues one.
+  Future<int> inferPotOpeningBalances() async {
+    int adjusted = 0;
+    for (final account in await getAllAccounts()) {
+      if (!isSavingsPotAccount(account)) continue;
+
+      final rows = await (_db.select(_db.transactions)
+            ..where((t) => (t.accountId.equals(account.id) |
+                    t.transferAccountId.equals(account.id)) &
+                t.status.isIn(kHiddenStatuses).not())
+            ..orderBy([(t) => OrderingTerm.asc(t.transactionDate)]))
+          .get();
+      if (rows.isEmpty) continue;
+
+      double running = 0;
+      double lowest = 0;
+      for (final t in rows) {
+        if (t.transferAccountId == account.id) {
+          running += t.toAmount ?? t.amountSource; // arriving in the pot
+        } else if (t.accountId == account.id) {
+          running -= t.amountSource; // leaving the pot
+        }
+        if (running < lowest) lowest = running;
+      }
+      if (lowest >= 0) continue;
+
+      final opening = -lowest;
+      if ((account.openingBalance - opening).abs() < 0.01) continue;
+      await (_db.update(_db.accounts)..where((a) => a.id.equals(account.id)))
+          .write(AccountsCompanion(openingBalance: Value(opening)));
+      await recomputeAccountBalance(account.id);
+      adjusted++;
+      debugPrint('🪣 ${account.name}: opening set to ${opening.toStringAsFixed(2)} '
+          'so the pot never reads negative');
+    }
+    return adjusted;
+  }
+
   /// Re-apply each account's newest known closing balance.
   ///
   /// Anchoring sets `opening = closing - effects` at the moment it runs.
@@ -2771,6 +2869,12 @@ class AppRepository {
     for (final account in await getAllAccounts()) {
       final info = await getAnchorInfo(account.id);
       if (info == null) continue;
+      if (!await _anchorStillBelongsHere(account.id)) {
+        await _clearAnchor(account.id);
+        debugPrint('⚓ Dropped ${account.name}\'s anchor — the statement it '
+            'came from is not this account\'s');
+        continue;
+      }
       // applyClosingBalance re-signs for cards, so hand it the magnitude
       // the bank stated rather than the stored, already-signed value.
       final stated = account.type == 'credit_card' ? info.closing.abs() : info.closing;
@@ -2778,6 +2882,65 @@ class AppRepository {
       n++;
     }
     if (n > 0) debugPrint('⚓ Re-anchored $n account(s) to their stated balances');
+    return n;
+  }
+
+  /// True when the statement that set this anchor still has transactions on
+  /// this account. Anchors recorded before provenance was tracked have no
+  /// statement id and are trusted, since dropping them would strand every
+  /// account that has not been re-read since.
+  Future<bool> _anchorStillBelongsHere(String accountId) async {
+    final statementId = await getAppSetting('anchor_stmt_$accountId');
+    if (statementId == null || statementId.isEmpty) return true;
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.sourceStatementId.equals(statementId) &
+              t.accountId.equals(accountId))
+          ..limit(1))
+        .get();
+    return rows.isNotEmpty;
+  }
+
+  Future<void> _clearAnchor(String accountId) async {
+    for (final key in [
+      'anchor_closing_$accountId',
+      'anchor_date_$accountId',
+      'anchor_drift_$accountId',
+      'anchor_stmt_$accountId',
+      'closing_date_$accountId',
+    ]) {
+      await (_db.delete(_db.appSettings)..where((x) => x.key.equals(key))).go();
+    }
+  }
+
+  /// Forget every anchor, so the next read of each account's newest
+  /// statement establishes it afresh from a correctly-routed document.
+  Future<int> clearAllAnchors() async {
+    final accounts = await getAllAccounts();
+    for (final a in accounts) {
+      await _clearAnchor(a.id);
+      await (_db.update(_db.accounts)..where((x) => x.id.equals(a.id)))
+          .write(const AccountsCompanion(openingBalance: Value(0)));
+      await recomputeAccountBalance(a.id);
+    }
+    return accounts.length;
+  }
+
+  /// Re-queue only the newest statement per source — enough to re-anchor
+  /// every account without reading three years of history again.
+  Future<int> requeueNewestPerSource() async {
+    final sources = await getAllStatementSources();
+    int n = 0;
+    for (final source in sources) {
+      final rows = await (_db.select(_db.statementQueue)
+            ..where((q) => q.sourceId.equals(source.id) &
+                q.status.isIn(['completed', 'empty']))
+            ..orderBy([(q) => OrderingTerm.desc(q.emailDate)])
+            ..limit(1))
+          .get();
+      if (rows.isEmpty) continue;
+      await updateStatementQueueStatus(rows.first.id, 'pending', errorMessage: null);
+      n++;
+    }
     return n;
   }
 

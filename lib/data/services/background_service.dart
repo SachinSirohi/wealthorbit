@@ -5,6 +5,7 @@ import 'package:enough_mail/enough_mail.dart';
 import '../../core/statement_backlog.dart';
 import '../../core/amount_sanity.dart';
 import '../database/database.dart';
+import '../models/discovered_source.dart';
 import '../repositories/app_repository.dart';
 import 'imap_service.dart';
 import 'gemini_service.dart';
@@ -454,6 +455,7 @@ Future<void> _processStatementQueue({
           // Older statements imported after the newest one anchored have
           // moved every balance away from what the bank actually said.
           await repository.reapplyAnchors();
+          await repository.inferPotOpeningBalances();
         } catch (e) {
           debugPrint('Re-anchor after drain failed: $e');
         }
@@ -684,38 +686,20 @@ Future<String?> _resolveSourceId(AppDatabase db, String fromAddress) async {
   return id;
 }
 
-/// Detect bank name from email address
-String _detectBankName(String email) {
-  final domain = email.split('@').lastOrNull?.toLowerCase() ?? '';
-  
-  final bankMap = {
-    'emirates': 'Emirates NBD',
-    'enbd': 'Emirates NBD',
-    'adcb': 'ADCB',
-    'mashreq': 'Mashreq',
-    'fab': 'First Abu Dhabi Bank',
-    'dib': 'Dubai Islamic Bank',
-    'cbd': 'Commercial Bank of Dubai',
-    'rakbank': 'RAK Bank',
-    'hsbc': 'HSBC',
-    'citi': 'Citibank',
-    'sc.com': 'Standard Chartered',
-    'standardchartered': 'Standard Chartered',
-    'hdfc': 'HDFC Bank',
-    'icici': 'ICICI Bank',
-    'sbi': 'State Bank of India',
-    'axis': 'Axis Bank',
-    'kotak': 'Kotak Mahindra',
-  };
-  
-  for (final entry in bankMap.entries) {
-    if (domain.contains(entry.key)) {
-      return entry.value;
-    }
-  }
-  
-  return 'Unknown Bank';
-}
+/// Detect bank name from an email address.
+///
+/// This used to consult a short hand-written map and answer "Unknown Bank"
+/// for anything missing — and unmapping deliberately spares unknown banks,
+/// since it cannot tell where they belong. The result was that every
+/// unidentified sender stayed pointed at whichever account the old
+/// first-account fallback had chosen: `NoReplyDeem@deem.io`, `vat@wio.io`
+/// and even `survey@dubaipolice.gov.ae` all aimed at Emirates NBD's card,
+/// where a Deem statement anchored it to Deem's closing balance.
+///
+/// DiscoveredSource.guessNameFromEmail already knows the banks and falls
+/// back to the sending domain, which answers deem.io and wio.io correctly.
+String _detectBankName(String email) =>
+    DiscoveredSource.guessNameFromEmail(email);
 
 /// Check budget alerts
 Future<void> _checkBudgetAlerts() async {

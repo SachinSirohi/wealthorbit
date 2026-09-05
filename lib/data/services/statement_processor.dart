@@ -368,7 +368,8 @@ class StatementProcessor {
         final d = StatementDate.parse((tx['date'] ?? '').toString());
         if (d != null && (stmtDate == null || d.isAfter(stmtDate))) stmtDate = d;
       }
-      await repository.applyClosingBalance(accountId, closingBalance, statementDate: stmtDate);
+      await repository.applyClosingBalance(accountId, closingBalance,
+          statementDate: stmtDate, statementId: statementId);
       debugPrint('🏦 Anchored $accountId to closing balance $closingBalance (stmt ${stmtDate?.toIso8601String().split('T').first ?? 'n/a'})');
     }
 

@@ -132,10 +132,52 @@ void main() async {
     // statements imported afterwards move the balance away from the figure
     // the bank reported. Re-deriving it every launch keeps each account on
     // the number its own statement last stated.
+    // One-shot (v4.13.0): anchors written while a statement was routed to
+    // the wrong account outlived the misrouting — Deem's card and Emirates
+    // NBD's card both sat on the same figure from one document. Forget them
+    // all and re-read only the newest statement per source, which is enough
+    // to re-anchor every account without three years of history again.
+    // One-shot (v4.14.0): senders the app could not name kept pointing at
+    // whichever account they were handed years ago, so a Deem statement
+    // anchored Emirates NBD's card to Deem's balance. Name them from their
+    // domain, re-map, and re-anchor from correctly-routed statements.
+    try {
+      if (!await repo.getBoolSetting('name_unknown_sources_v4140')) {
+        final named = await repo.renameUnknownSources();
+        await repo.unmapMisroutedSources();
+        await repo.autoMapUnmappedSources();
+        await repo.clearAllAnchors();
+        final n = await repo.requeueNewestPerSource();
+        await repo.setAppSetting('name_unknown_sources_v4140', 'true');
+        debugPrint('🏷️ Named $named source(s); $n statement(s) re-queued to re-anchor');
+      }
+    } catch (e) {
+      debugPrint('name_unknown_sources_v4140 skipped: $e');
+    }
+
+    try {
+      if (!await repo.getBoolSetting('anchor_provenance_v4130')) {
+        await repo.clearAllAnchors();
+        final n = await repo.requeueNewestPerSource();
+        await repo.setAppSetting('anchor_provenance_v4130', 'true');
+        debugPrint('⚓ Anchor reset: $n newest statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('anchor_provenance_v4130 skipped: $e');
+    }
     try {
       await repo.reapplyAnchors();
     } catch (e) {
       debugPrint('reapplyAnchors skipped: $e');
+    }
+    // A pot only shows up when money moves through it, so whatever was
+    // parked before the imported window is invisible and the balance can
+    // read negative. Infer the smallest opening balance consistent with the
+    // movements on record.
+    try {
+      await repo.inferPotOpeningBalances();
+    } catch (e) {
+      debugPrint('inferPotOpeningBalances skipped: $e');
     }
 
     // One-shot (v4.1.0): repair the statement pipeline.

@@ -392,7 +392,16 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
           ],
         ),
         const SizedBox(height: 8),
-        ..._failed.take(12).map((item) {
+        // Password-blocked statements are grouped by bank: one password
+        // unlocks every statement from that sender, so 19 separate rows
+        // asking the same question is 19 times more work than it needs to
+        // be. Extraction tries every saved password against every PDF, so
+        // in practice a handful of entries clears the lot.
+        ..._passwordGroups().map(_buildPasswordGroup),
+        ..._failed
+            .where((f) => !(f.errorMessage ?? '').toLowerCase().contains('password'))
+            .take(12)
+            .map((item) {
           final err = item.errorMessage ?? 'Failed';
           final needsPassword = err.toLowerCase().contains('password');
           final dateLabel = DateFormat.yMMMd().format(item.emailDate.toLocal());
@@ -470,6 +479,140 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   /// rejected real lines before, and a completed statement is never looked at
   /// again — this is the way to recover them. Dedupe means nothing already
   /// imported comes back twice.
+  /// Password-blocked statements bucketed by the bank that sent them,
+  /// most-blocked first.
+  List<MapEntry<String, List<StatementQueueData>>> _passwordGroups() {
+    final groups = <String, List<StatementQueueData>>{};
+    for (final item in _failed) {
+      if (!(item.errorMessage ?? '').toLowerCase().contains('password')) continue;
+      final source = _sources.where((s) => s.id == item.sourceId).firstOrNull;
+      final bank = source?.bankName.trim().isNotEmpty == true
+          ? source!.bankName.trim()
+          : 'Unknown sender';
+      groups.putIfAbsent(bank, () => []).add(item);
+    }
+    final entries = groups.entries.toList()
+      ..sort((a, b) => b.value.length.compareTo(a.value.length));
+    return entries;
+  }
+
+  Widget _buildPasswordGroup(MapEntry<String, List<StatementQueueData>> group) {
+    final items = group.value;
+    final oldest = items.map((i) => i.emailDate).reduce((a, b) => a.isBefore(b) ? a : b);
+    final newest = items.map((i) => i.emailDate).reduce((a, b) => a.isAfter(b) ? a : b);
+    final span = DateFormat.yMMM().format(oldest) == DateFormat.yMMM().format(newest)
+        ? DateFormat.yMMM().format(newest)
+        : '${DateFormat.yMMM().format(oldest)} – ${DateFormat.yMMM().format(newest)}';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: woCard(radius: 16, tint: WoColors.red),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(CupertinoIcons.lock_fill, color: WoColors.red, size: 15),
+              const SizedBox(width: 8),
+              Expanded(child: Text(group.key, style: WoText.subtitle())),
+              WoChip('${items.length}', color: WoColors.red),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${items.length} statement${items.length == 1 ? '' : 's'} · $span\n'
+            'One password unlocks all of them.',
+            style: WoText.caption(),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ElevatedButton(
+              style: WoButtons.primary,
+              onPressed: () => _fixGroupPassword(group.key, items),
+              child: const Text('Set password & retry'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Save one password for a whole bank's blocked statements and re-queue
+  /// them together.
+  Future<void> _fixGroupPassword(
+      String bank, List<StatementQueueData> items) async {
+    final first = items.first;
+    final source = _sources.where((s) => s.id == first.sourceId).firstOrNull;
+    final controller = TextEditingController(
+      text: await SecureVault.resolvePdfPassword(
+            sourceId: first.sourceId,
+            senderEmail: source?.senderEmail,
+            bankName: source?.bankName,
+          ) ??
+          '',
+    );
+    if (!mounted) return;
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: WoColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
+        title: Text('$bank PDF password', style: WoText.title()),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Unlocks ${items.length} blocked statement'
+              '${items.length == 1 ? '' : 's'} from $bank.',
+              style: WoText.caption(),
+            ),
+            const SizedBox(height: 8),
+            Text(_passwordHint(bank, source?.senderEmail ?? ''),
+                style: WoText.caption(color: WoColors.textMid)),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              obscureText: true,
+              style: GoogleFonts.inter(color: WoColors.textHi),
+              decoration: woInput('Password'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.poppins(color: WoColors.textMid)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: WoButtons.primary,
+            child: const Text('Save & retry'),
+          ),
+        ],
+      ),
+    );
+    if (saved != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final password = controller.text.trim();
+    for (final item in items) {
+      await SecureVault.setPdfPasswordForSource(
+        sourceId: item.sourceId ?? item.id,
+        senderEmail: source?.senderEmail,
+        password: password,
+      );
+      await _repo!.requeueStatementItem(item.id);
+    }
+    if (!mounted) return;
+    messenger.showSnackBar(SnackBar(
+      content: Text('Saved — ${items.length} $bank statement'
+          '${items.length == 1 ? '' : 's'} re-queued. Tap Sync Now.'),
+    ));
+    await _loadData(showSpinner: false);
+  }
+
   Future<void> _reExtractProcessed() async {
     final confirmed = await showDialog<bool>(
       context: context,
