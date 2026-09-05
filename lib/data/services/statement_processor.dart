@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import '../../core/amount_sanity.dart';
 import '../../core/statement_date.dart';
 import '../../core/statement_kind.dart';
+import '../../core/savings_space.dart';
 import '../database/database.dart';
 import '../repositories/app_repository.dart';
 import 'gemini_service.dart';
@@ -275,6 +276,47 @@ class StatementProcessor {
           description: description)) {
         skippedDupes++;
         continue;
+      }
+
+      // Money moved into or out of a savings pot at the same bank is not
+      // spending or income — the user still has it. Route it to an account
+      // standing for the pot, so a fixed deposit shows up as the balance it
+      // is instead of vanishing the moment it is funded.
+      final potMove = SavingsSpace.detect(description);
+      if (potMove != null && account != null) {
+        final pot = await repository.ensureSavingsPotAccount(
+          bankName: account.name,
+          pot: potMove.pot,
+          currencyCode: currency,
+        );
+        if (pot.id != accountId) {
+          await repository.insertTransaction(
+            TransactionsCompanion.insert(
+              id: statementLineId(
+                accountId: accountId,
+                date: date,
+                amount: amount,
+                type: 'transfer',
+                description: description,
+              ),
+              // A move INTO the pot leaves this account; a move out arrives.
+              accountId: potMove.intoPot ? accountId : pot.id,
+              transferAccountId: Value(potMove.intoPot ? pot.id : accountId),
+              amountSource: amount,
+              amountBase: amount * rateToBase,
+              currencyCode: currency,
+              description: description,
+              type: 'transfer',
+              txnClass: const Value('savings_transfer'),
+              transactionDate: date,
+              sourceStatementId: Value(statementId),
+              status: const Value('cleared'),
+            ),
+            replaceExisting: true,
+          );
+          count++;
+          continue;
+        }
       }
 
       // Category: user-learned merchant mapping → AI hint → income keywords.

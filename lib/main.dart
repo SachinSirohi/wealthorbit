@@ -274,6 +274,40 @@ void main() async {
       debugPrint('route_by_kind_v470 skipped: $e');
     }
 
+    // One-shot (v4.8.0): savings pots are now modelled, so money parked in
+    // a fixed deposit stops reading as spending. Read everything once more
+    // so the whole history lands with correct dates, the right account per
+    // document, card repayments out of income, and pots as balances.
+    try {
+      if (!await repo.getBoolSetting('savings_pots_rebuild_v480')) {
+        final superseded = await repo.quarantineAllStatementTransactions();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('savings_pots_rebuild_v480', 'true');
+        debugPrint('🪣 Pot rebuild: $superseded row(s) set aside, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('savings_pots_rebuild_v480 skipped: $e');
+    }
+
+    // One-shot (v4.9.0): a savings statement that scored too few markers
+    // stayed in the credit-card account it had been aimed at, where its
+    // balance was stored as debt. Marker set widened; read everything once
+    // more so each statement lands in the right account. Also reclassifies
+    // non-statements out of the failure list.
+    try {
+      if (!await repo.getBoolSetting('kind_markers_rebuild_v490')) {
+        await repo.reclassifyNonStatements();
+        final superseded = await repo.quarantineAllStatementTransactions();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('kind_markers_rebuild_v490', 'true');
+        debugPrint('🧭 Routing rebuild: $superseded row(s) set aside, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('kind_markers_rebuild_v490 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {

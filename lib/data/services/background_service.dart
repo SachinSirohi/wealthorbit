@@ -94,7 +94,7 @@ class BackgroundService {
   /// a job that overruns its execution window.
   static Future<void> processStatementQueueNow({
     int maxItems = StatementBacklog.drainBatchSize,
-    Duration deadline = const Duration(minutes: 12),
+    Duration deadline = const Duration(minutes: 25),
     void Function(String status)? onProgress,
   }) =>
       _processStatementQueue(
@@ -338,7 +338,9 @@ Future<void> _processStatementQueue({
                 : null;
 
             if (pdfs.isEmpty) {
-              await repository.updateStatementQueueStatus(item.id, 'empty',
+              // Not a statement at all — discovery casts a wide net and
+              // catches notifications and newsletters. Nothing to fix.
+              await repository.updateStatementQueueStatus(item.id, 'skipped',
                   errorMessage: 'This email had no PDF attachment.');
               emptied++;
               noteReason('no PDF attached');
@@ -392,6 +394,16 @@ Future<void> _processStatementQueue({
                     );
               transactionCount += result.imported;
               emptyReason ??= result.emptyReason;
+            }
+
+            // A broker's weekly trade list contains no holdings by design.
+            if (transactionCount == 0 &&
+                (emptyReason ?? '').contains('transaction statement')) {
+              await repository.updateStatementQueueStatus(item.id, 'skipped',
+                  errorMessage: emptyReason);
+              emptied++;
+              noteReason('not a holdings report');
+              continue;
             }
 
             if (transactionCount == 0) {

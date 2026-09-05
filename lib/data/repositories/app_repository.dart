@@ -5,6 +5,7 @@ import '../services/secure_vault.dart';
 import '../../core/utils/currency_utils.dart';
 import '../../core/amount_sanity.dart';
 import '../../core/merchant_rules.dart';
+import '../../core/savings_space.dart';
 import '../services/statement_processor.dart' show isBrokerageSender;
 
 /// Status marking the counter-leg of a matched transfer.
@@ -479,9 +480,20 @@ class AppRepository {
 
   Future<List<StatementQueueData>> getFailedStatementQueue() =>
     (_db.select(_db.statementQueue)
+      // `skipped` is deliberately absent: an email with no PDF, or a
+      // broker's weekly trade list, is not a statement this app can import
+      // and never will be. 157 of them were being presented as problems to
+      // fix, which buries the handful that are.
       ..where((t) => t.status.isIn(['failed', 'empty']))
       ..orderBy([(t) => OrderingTerm.desc(t.processedAt)]))
       .get();
+
+  /// Emails that turned out not to be importable statements. Informational.
+  Future<int> countSkippedStatements() async =>
+      (await (_db.select(_db.statementQueue)
+                ..where((t) => t.status.equals('skipped')))
+              .get())
+          .length;
 
   /// Re-queue failed items (optionally only LLM timeouts).
   Future<int> requeueFailedStatements({bool timeoutsOnly = false}) async {
@@ -1465,7 +1477,7 @@ class AppRepository {
   }
     
   Future<void> updateStatementQueueStatus(String id, String status, {String? errorMessage}) {
-    const terminal = ['completed', 'failed', 'empty'];
+    const terminal = ['completed', 'failed', 'empty', 'skipped'];
     return (_db.update(_db.statementQueue)..where((t) => t.id.equals(id))).write(
       StatementQueueCompanion(
         status: Value(status),
@@ -1564,6 +1576,27 @@ class AppRepository {
     return count;
   }
 
+  /// Move emails that are not importable statements out of the failure
+  /// list, where they were being presented as problems to fix.
+  Future<int> reclassifyNonStatements() async {
+    final rows = await (_db.select(_db.statementQueue)
+          ..where((q) => q.status.isIn(['failed', 'empty'])))
+        .get();
+    int n = 0;
+    for (final row in rows) {
+      final reason = (row.errorMessage ?? '').toLowerCase();
+      final notAStatement = reason.contains('no pdf attachment') ||
+          reason.contains('not a bank statement') ||
+          reason.contains('transaction statement, not a holdings');
+      if (!notAStatement) continue;
+      await updateStatementQueueStatus(row.id, 'skipped',
+          errorMessage: row.errorMessage);
+      n++;
+    }
+    if (n > 0) debugPrint('🗂️ $n non-statement email(s) moved out of failures');
+    return n;
+  }
+
   /// Re-open statements that closed themselves as "already imported" while
   /// the duplicate gate was matching against rows that had been set aside.
   Future<int> requeueFalselyEmptyStatements() async {
@@ -1605,6 +1638,36 @@ class AppRepository {
       await recomputeAccountBalance(id);
     }
     return rows.length;
+  }
+
+  /// The account standing for a savings pot held at [bankName], created on
+  /// first sight. Money parked in a pot is still the user's money, so it
+  /// needs somewhere to live — otherwise a fixed deposit simply vanishes
+  /// from net worth the moment it is funded.
+  Future<Account> ensureSavingsPotAccount({
+    required String bankName,
+    required String pot,
+    required String currencyCode,
+  }) async {
+    final name = SavingsSpace.accountName(bankName, pot);
+    final existing = (await getAllAccounts())
+        .where((a) => a.name.toLowerCase() == name.toLowerCase())
+        .firstOrNull;
+    if (existing != null) return existing;
+
+    final id = 'acct_pot_${name.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '_')}';
+    final already = await getAccount(id);
+    if (already != null) return already;
+
+    await insertAccount(AccountsCompanion.insert(
+      id: id,
+      name: name,
+      type: 'bank',
+      currencyCode: currencyCode,
+      institution: Value(bankName),
+    ));
+    debugPrint('🏦 Created savings pot account "$name"');
+    return (await getAccount(id))!;
   }
 
   /// The account a statement belongs in, given what the document actually

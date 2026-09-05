@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:wealth_orbit/core/amount_sanity.dart';
 import 'package:wealth_orbit/core/statement_date.dart';
 import 'package:wealth_orbit/core/statement_kind.dart';
+import 'package:wealth_orbit/core/savings_space.dart';
 import 'package:wealth_orbit/core/merchant_rules.dart';
 import 'package:wealth_orbit/data/services/llm_router.dart';
 import 'package:wealth_orbit/data/services/secure_vault.dart';
@@ -576,6 +577,72 @@ Date Description Amount
 """;
       expect(
           StatementKindDetector.detect(almost), isNot(StatementKind.creditCard));
+    });
+  });
+
+  group('SavingsSpace', () {
+    // Taken from a real Wio statement: a fixed deposit is a movement between
+    // the current account and a named pot, and reads as spending + income
+    // unless it is recognised.
+    test('money going into a pot', () {
+      final m = SavingsSpace.detect(
+          'Sirohi Sachin Gyanendra Singh Sirohi to Fixed Saving Space');
+      expect(m, isNotNull);
+      expect(m!.pot, 'Fixed Saving Space');
+      expect(m.intoPot, isTrue);
+    });
+
+    test('money coming back out of a pot', () {
+      final m = SavingsSpace.detect(
+          'Fixed Saving Space to Sirohi Sachin Gyanendra Singh Sirohi');
+      expect(m, isNotNull);
+      expect(m!.pot, 'Fixed Saving Space');
+      expect(m.intoPot, isFalse);
+    });
+
+    test('a shorter pot name works the same way', () {
+      final m = SavingsSpace.detect('Saving to Sirohi Sachin Gyanendra Singh');
+      expect(m?.pot, 'Saving');
+      expect(m?.intoPot, isFalse);
+    });
+
+    test('interest stays income and is never a transfer', () {
+      // "Interest applied from Fixed Saving Space" names a pot but is money
+      // genuinely earned — folding it into a transfer would erase it.
+      expect(SavingsSpace.detect('Interest applied from Fixed Saving Space'),
+          isNull);
+      expect(SavingsSpace.detect('Interest applied from Saving'), isNull);
+      expect(SavingsSpace.detect('Profit applied from Saving Space'), isNull);
+    });
+
+    test('ordinary payments are left alone', () {
+      for (final d in [
+        'POS CARREFOUR MALL OF THE EMIRATES',
+        'UPI/SWIGGY/1234',
+        'Transfer to Ahmed Hassan',
+        'Credit Repayment Autopay',
+        'From SACHIN SIROHI',
+      ]) {
+        expect(SavingsSpace.detect(d), isNull, reason: d);
+      }
+    });
+
+    test('a company that merely contains the word is not a pot', () {
+      // Hiding real spending is worse than missing a pot, so the rule is
+      // deliberately narrow.
+      expect(
+        SavingsSpace.detect('Transfer to Ahmed Saving Trading Company LLC'),
+        isNull,
+      );
+    });
+
+    test('both sides looking like pots tells us nothing', () {
+      expect(SavingsSpace.detect('Saving Space to Saving Vault'), isNull);
+    });
+
+    test('pot accounts are named per bank', () {
+      expect(SavingsSpace.accountName('Wio', 'Fixed Saving Space'),
+          'Wio · Fixed Saving Space');
     });
   });
 }

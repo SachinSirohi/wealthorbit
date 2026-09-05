@@ -37,10 +37,21 @@ class StatementKindDetector {
   /// statement may legitimately mention an IBAN for making the payment.
   static final List<RegExp> _bankMarkers = [
     RegExp(r'\bopening\s*balance\b', caseSensitive: false),
+    RegExp(r'\bclosing\s*balance\b', caseSensitive: false),
     RegExp(r'\bavailable\s*balance\b', caseSensitive: false),
     RegExp(r'\bsavings?\s*account\b', caseSensitive: false),
     RegExp(r'\bcurrent\s*account\b', caseSensitive: false),
     RegExp(r'\bvalue\s*date\b', caseSensitive: false),
+    // A real Emirates NBD savings statement scored only one marker and so
+    // stayed in the credit-card account it had been aimed at, where its
+    // balance was stored as debt. These are what that document actually
+    // says: an account number, an IBAN, a branch, an interest payout.
+    RegExp(r'\baccount\s*(no\.?|number)\b', caseSensitive: false),
+    RegExp(r'\biban\b', caseSensitive: false),
+    RegExp(r'\bbranch\b', caseSensitive: false),
+    RegExp(r'\binterest\s*payout\b', caseSensitive: false),
+    RegExp(r'\bstatement\s*of\s*account\b', caseSensitive: false),
+    RegExp(r'\bdeposit\b', caseSensitive: false),
   ];
 
   /// How many card phrases must appear before a document counts as a card
