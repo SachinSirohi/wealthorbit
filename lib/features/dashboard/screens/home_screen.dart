@@ -11,6 +11,7 @@ import '../../../core/theme/wo_design.dart';
 import '../../../core/utils/currency_utils.dart';
 import '../../../data/database/database.dart';
 import '../../../data/repositories/app_repository.dart';
+import '../../../data/services/financial_health_service.dart';
 import '../../../data/services/secure_vault.dart';
 import '../../../data/services/gemini_service.dart';
 import '../../../data/services/insights_service.dart';
@@ -36,6 +37,9 @@ class _HomeScreenState extends State<HomeScreen> {
   double _totalAccounts = 0;
   double _monthlyIncome = 0;
   double _monthlyExpenses = 0;
+  /// Null when the figures are for the current month; otherwise the month
+  /// they actually belong to, so the card never implies data it lacks.
+  DateTime? _periodShown;
   int _emergencyFundMonths = 0;
   double _budgetUsed = 0;
   double _budgetTotal = 0;
@@ -83,8 +87,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
       // Monthly data
       final now = DateTime.now();
-      final income = await _repo!.getTotalIncomeByMonth(now.year, now.month);
-      final expenses = await _repo!.getTotalExpensesByMonth(now.year, now.month);
+      // Early in a month the current one is legitimately empty, because last
+      // month's statement has not arrived yet. Show the latest month that
+      // does have data, and say which.
+      final period = await _repo!.latestMonthWithData();
+      final income = period.income;
+      final expenses = period.expenses;
 
       // 6-month income / expense series for the cashflow chart
       final expenseSeries = await _repo!.getMonthlyExpenses(6);
@@ -131,7 +139,15 @@ class _HomeScreenState extends State<HomeScreen> {
         insights = await _repo!.getActiveInsights();
       } catch (_) {}
 
-      final coach = await _repo!.getCoachReport(now.year, now.month);
+      // A coach report written for a month that no longer has enough data
+      // must not keep standing — it narrated "September was a challenging
+      // month" about a month with nothing in it.
+      var coach = await _repo!.getCoachReport(now.year, now.month);
+      if (coach != null &&
+          await _repo!.countTransactionsInMonth(now.year, now.month) <
+              FinancialHealthService.minTransactionsToScore) {
+        coach = null;
+      }
 
       if (!mounted) return;
       setState(() {
@@ -142,6 +158,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _totalAccounts = totalAccounts;
         _monthlyIncome = income;
         _monthlyExpenses = expenses;
+        _periodShown = period.isCurrent ? null : DateTime(period.year, period.month);
         _expenseSeries = expenseSeries;
         _incomeSeries = incomeSeries;
         _emergencyFundMonths = emergencyMonths;
@@ -273,7 +290,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 Expanded(
                   child: _heroStat(
-                    'This Month',
+                    _periodShown == null
+                        ? 'This Month'
+                        : DateFormat('MMMM').format(_periodShown!),
                     _monthlyIncome >= _monthlyExpenses
                         ? '+${_formatCompact(_monthlyIncome - _monthlyExpenses)}'
                         : '-${_formatCompact(_monthlyExpenses - _monthlyIncome)}',

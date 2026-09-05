@@ -2723,6 +2723,40 @@ class AppRepository {
     await recomputeAccountBalance(accountId);
   }
 
+  /// The most recent month that actually has transactions, and its totals.
+  ///
+  /// A statement for August arrives in early September, so for the first
+  /// days of a month the current one is legitimately empty — and the
+  /// dashboard showed "+0.00", "0 months of runway" and "0% saved", which
+  /// reads as broken rather than as "this month has not happened yet".
+  /// Falling back to the latest month that has data, and saying which month
+  /// that is, tells the truth without looking like a failure.
+  Future<({int year, int month, double income, double expenses, bool isCurrent})>
+      latestMonthWithData({int lookBack = 6}) async {
+    final now = DateTime.now();
+    for (var i = 0; i < lookBack; i++) {
+      final d = DateTime(now.year, now.month - i, 1);
+      final income = await getTotalIncomeByMonth(d.year, d.month);
+      final expenses = await getTotalExpensesByMonth(d.year, d.month);
+      if (income > 0 || expenses > 0) {
+        return (
+          year: d.year,
+          month: d.month,
+          income: income,
+          expenses: expenses,
+          isCurrent: i == 0,
+        );
+      }
+    }
+    return (
+      year: now.year,
+      month: now.month,
+      income: 0.0,
+      expenses: 0.0,
+      isCurrent: true,
+    );
+  }
+
   /// Re-apply each account's newest known closing balance.
   ///
   /// Anchoring sets `opening = closing - effects` at the moment it runs.
