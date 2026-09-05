@@ -137,6 +137,11 @@ class StatementProcessor {
     final isCardAccount = account?.type == 'credit_card';
     final rateToBase = (await repository.getCurrency(currency))?.rateToBase ?? 1.0;
 
+    // Keep a sample of the extracted text, as the brokerage path does. Bank
+    // statements carry balances the app does not model yet — fixed deposits,
+    // savings pots — and those need designing against a real document.
+    await _sampleStatementText(account?.name ?? accountId, text);
+
     final parsed =
         await GeminiService.parseStatementText(text, isCreditCard: isCardAccount);
     final closingBalance = GeminiService.lastClosingBalance;
@@ -346,6 +351,20 @@ class StatementProcessor {
           '(CAS); add edcas@cdslindia.com as a source to import them.';
     }
     return 'No holdings were found in this portfolio statement.';
+  }
+
+  /// Sample of a bank statement's extracted text, for inspection over ADB.
+  static Future<void> _sampleStatementText(String label, String text) async {
+    try {
+      final dir = await getExternalStorageDirectory();
+      if (dir == null) return;
+      final safe = label.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '_');
+      final file = File('${dir.path}/statement_sample_$safe.txt');
+      await file.writeAsString(
+          text.length > 8000 ? text.substring(0, 8000) : text);
+    } catch (_) {
+      // diagnostics only — never let this affect an import
+    }
   }
 
   /// Write the first few thousand characters of a brokerage statement to

@@ -5,6 +5,7 @@ import 'package:wealth_orbit/core/merchant_rules.dart';
 import 'package:wealth_orbit/data/services/llm_router.dart';
 import 'package:wealth_orbit/data/services/secure_vault.dart';
 import 'package:wealth_orbit/core/utils/currency_utils.dart';
+import 'package:wealth_orbit/data/database/database.dart';
 import 'package:wealth_orbit/data/repositories/app_repository.dart';
 import 'package:wealth_orbit/data/services/statement_processor.dart';
 
@@ -462,6 +463,56 @@ void main() {
       expect(kInternalTransferClasses, contains('cc_payment'));
       expect(kInternalTransferClasses, isNot(contains('purchase')));
       expect(kInternalTransferClasses, isNot(contains('income')));
+    });
+  });
+
+  group('salary is never a transfer leg', () {
+    Transaction tx({
+      String type = 'income',
+      String? category,
+      String? txnClass,
+      String description = 'CREDIT',
+    }) =>
+        Transaction(
+          id: 'x',
+          accountId: 'a',
+          amountSource: 18000,
+          amountBase: 18000,
+          currencyCode: 'AED',
+          description: description,
+          type: type,
+          status: 'cleared',
+          transactionDate: DateTime(2026, 8, 25),
+          isRecurring: false,
+          createdAt: DateTime(2026, 8, 25),
+          categoryId: category,
+          txnClass: txnClass,
+        );
+
+    test('a salary credit is recognised as external income', () {
+      expect(AppRepository.isExternalIncome(tx(category: 'cat_salary')), isTrue);
+      expect(AppRepository.isExternalIncome(tx(txnClass: 'income')), isTrue);
+      expect(
+          AppRepository.isExternalIncome(tx(description: 'SALARY AUG 2026')),
+          isTrue);
+      expect(AppRepository.isExternalIncome(tx(description: 'PAYROLL CREDIT')),
+          isTrue);
+    });
+
+    test('an ordinary credit is still matchable', () {
+      // A card repayment landing on a bank account has a counter-leg to find.
+      expect(
+        AppRepository.isExternalIncome(tx(description: 'PAYMENT RECEIVED')),
+        isFalse,
+      );
+    });
+
+    test('an expense is never external income', () {
+      expect(
+        AppRepository.isExternalIncome(
+            tx(type: 'expense', description: 'SALARY ADVANCE RECOVERY')),
+        isFalse,
+      );
     });
   });
 }

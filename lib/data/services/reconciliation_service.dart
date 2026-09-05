@@ -105,7 +105,14 @@ class ReconciliationService {
     final txs = await repository.getUnmatchedIncomeExpense(daysBack: daysBack);
     if (txs.length < 2) return (0, 0);
 
-    final clipped = txs.take(maxCandidates).toList();
+    // Never put salary in front of the matcher. Money arriving from outside
+    // has no counter-leg to find, and a wrong match would delete it from
+    // income entirely.
+    final candidates =
+        txs.where((t) => !AppRepository.isExternalIncome(t)).toList();
+    if (candidates.length < 2) return (0, 0);
+
+    final clipped = candidates.take(maxCandidates).toList();
     final accountPayload = accounts
         .map((a) => {
               'id': a.id,

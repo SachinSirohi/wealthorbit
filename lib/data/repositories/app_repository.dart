@@ -41,6 +41,17 @@ const List<String> kHiddenStatuses = [
 /// because the transfer row already stands for it.
 const List<String> kLedgerHiddenStatuses = [kMergedStatus, kQuarantinedStatus];
 
+/// Categories and classes that mark money genuinely arriving from outside.
+/// A salary credit is external income by definition, so it must never be
+/// folded into an "own-account transfer" — doing so removes it from income
+/// entirely, and a missing salary is not a subtle error to spot.
+const List<String> kExternalIncomeCategories = [
+  'cat_salary',
+  'cat_business',
+  'cat_interest',
+  'cat_rent_income',
+];
+
 /// Transaction classes that move money between the user's OWN accounts and
 /// are therefore neither income nor spending.
 ///
@@ -183,6 +194,19 @@ class AppRepository {
   /// converted to the base currency. Credit cards are debt instruments and
   /// are reported under liabilities instead — a card never inflates or
   /// deflates the "Accounts" cash figure.
+  /// True when this row is money arriving from outside and must not be
+  /// treated as one leg of an internal transfer.
+  static bool isExternalIncome(Transaction t) {
+    if (t.type != 'income') return false;
+    if (t.categoryId != null && kExternalIncomeCategories.contains(t.categoryId)) {
+      return true;
+    }
+    if (t.txnClass == 'income') return true;
+    return RegExp(r'\bsalar|\bpayroll\b|sal cr\b|\bwages\b|\bstipend\b',
+            caseSensitive: false)
+        .hasMatch('${t.description} ${t.merchant ?? ''}');
+  }
+
   /// True when an account's displayed balance is not trustworthy.
   ///
   /// A balance is only ever as good as the ledger behind it. When no bank
@@ -601,6 +625,8 @@ class AppRepository {
     if (out == null || inc == null) return false;
     if (out.type == 'transfer' || inc.type == 'transfer') return false;
     if (out.accountId == inc.accountId) return false;
+    // Last line of defence, whichever matcher proposed this pair.
+    if (isExternalIncome(out) || isExternalIncome(inc)) return false;
 
     // Prefer expense → income orientation; if swapped, flip.
     Transaction source = out;
@@ -1986,6 +2012,7 @@ class AppRepository {
       for (final inc in incomes) {
         if (consumed.contains(inc.id)) continue;
         if (inc.accountId == out.accountId) continue;
+        if (isExternalIncome(inc)) continue; // salary is not a transfer leg
         if (inc.currencyCode != out.currencyCode) continue;
         if ((inc.amountSource - out.amountSource).abs() > 0.01) continue;
         if (inc.transactionDate.difference(out.transactionDate).inDays.abs() > 3) continue;
@@ -2244,6 +2271,7 @@ class AppRepository {
       double bestScore = 0;
       for (final inc in ins) {
         if (used.contains(inc.id) || inc.accountId == out.accountId) continue;
+        if (isExternalIncome(inc)) continue; // salary is not a transfer leg
         if (inc.transactionDate.difference(out.transactionDate).inDays.abs() > 5) continue;
         final target = byId[inc.accountId];
         if (out.txnClass == 'cc_payment' && target?.type != 'credit_card') continue;

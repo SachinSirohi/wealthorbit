@@ -530,11 +530,24 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
   }
 
   Future<void> _fixFailedPassword(StatementQueueData item) async {
+    // A statement with no mapped source used to return here, so the button
+    // opened nothing and said nothing — you could tap "Set password & retry"
+    // all day and the statement would keep failing. Those are exactly the
+    // items that need a password most, so they get the dialog too: the key
+    // is stored against the queue row, and extraction tries every saved
+    // password before giving up, so it still reaches this PDF.
     final sourceId = item.sourceId;
-    if (sourceId == null) return;
-    final source = _sources.where((s) => s.id == sourceId).firstOrNull;
+    final source =
+        sourceId == null ? null : _sources.where((s) => s.id == sourceId).firstOrNull;
     final controller = TextEditingController(
-      text: await SecureVault.getPdfPassword(sourceId) ?? '',
+      // Resolve across every key space, not just the source id, or a
+      // password saved during onboarding looks absent here.
+      text: await SecureVault.resolvePdfPassword(
+            sourceId: sourceId,
+            senderEmail: source?.senderEmail,
+            bankName: source?.bankName,
+          ) ??
+          '',
     );
     if (!mounted) return;
     final saved = await showDialog<bool>(
@@ -578,7 +591,9 @@ class _StatementAutomationScreenState extends State<StatementAutomationScreen> {
     );
     if (saved != true || !mounted) return;
     await SecureVault.setPdfPasswordForSource(
-      sourceId: sourceId,
+      // With no source, key it to the queue row — the known-password sweep
+      // during extraction will still find and try it.
+      sourceId: sourceId ?? item.id,
       senderEmail: source?.senderEmail,
       password: controller.text.trim(),
     );
