@@ -182,6 +182,29 @@ void main() async {
       debugPrint('unmap_misrouted_sources_v421 skipped: $e');
     }
 
+    // One-shot (v4.3.0): put the ledger back on a sound footing.
+    //
+    // Statement dates were being invented until 4.2.1 — anything not in
+    // ISO-8601 was filed under "today", so years of history sat in the
+    // current month. Nothing downstream of that can be trusted until the
+    // statements are read again, so this re-queues every processed one.
+    // Dedupe means nothing already correct is duplicated; the queue drains
+    // a batch at a time in the background.
+    try {
+      if (!await repo.getBoolSetting('ledger_rebuild_v430')) {
+        final mapped = await repo.autoMapUnmappedSources();
+        final brokerage = await repo.resetBrokerageLedgers();
+        final categorised = await repo.autoCategoriseUncategorised();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('ledger_rebuild_v430', 'true');
+        debugPrint('🧱 Ledger rebuild: $mapped source(s) mapped, '
+            '$brokerage brokerage row(s) quarantined, '
+            '$categorised categorised, $requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('ledger_rebuild_v430 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {

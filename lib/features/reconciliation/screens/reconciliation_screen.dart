@@ -27,6 +27,9 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
   // Per-account: what the bank's last statement said vs what the ledger
   // could explain. The pipeline used to anchor silently; now the gap shows.
   final List<_AnchorVm> _anchors = [];
+  int _pendingCount = 0;
+  int _uncategorisedCount = 0;
+  bool _busy = false;
 
   @override
   void initState() {
@@ -57,6 +60,11 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
       if (info != null) _anchors.add(_AnchorVm(account: a, closing: info.closing, date: info.date, drift: info.drift));
     }
     _anchors.sort((x, y) => y.drift.abs().compareTo(x.drift.abs()));
+
+    _pendingCount = await _repo!.countPendingTransactions();
+    _uncategorisedCount = (await _repo!.getAllTransactions())
+        .where((t) => t.categoryId == null && t.type != 'transfer')
+        .length;
 
     final pendingSuggestions = await _repo!.getPendingSuggestedMatches();
     final vms = <_SuggestedTransferVm>[];
@@ -144,7 +152,11 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final empty = _accounts.isEmpty && _suggestions.isEmpty && _anchors.isEmpty;
+    final empty = _accounts.isEmpty &&
+        _suggestions.isEmpty &&
+        _anchors.isEmpty &&
+        _pendingCount == 0 &&
+        _uncategorisedCount == 0;
     return Scaffold(
       backgroundColor: WoColors.bg,
       appBar: AppBar(
@@ -159,6 +171,7 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
               : ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
+                    _buildBulkActions(),
                     if (_anchors.isNotEmpty) ...[
                       WoSectionHeader(
                         'Statement check',
@@ -196,6 +209,105 @@ class _ReconciliationScreenState extends State<ReconciliationScreen> {
         title: 'Everything reconciled',
         hint: 'No pending imports or suggested transfers to review',
       );
+
+  /// Reviewing a thousand imported rows one at a time is not a workflow.
+  /// A first sync produces well over that, so the bulk paths have to exist
+  /// or the pending queue simply never gets dealt with.
+  Widget _buildBulkActions() {
+    if (_pendingCount == 0 && _uncategorisedCount == 0) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 18),
+      padding: const EdgeInsets.all(16),
+      decoration: woCard(radius: 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Bulk actions', style: WoText.subtitle()),
+          const SizedBox(height: 4),
+          Text(
+            '$_pendingCount imported transaction(s) awaiting review · '
+            '$_uncategorisedCount uncategorised',
+            style: WoText.caption(),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              if (_uncategorisedCount > 0)
+                Expanded(
+                  child: OutlinedButton(
+                    style: WoButtons.ghost,
+                    onPressed: _busy ? null : _autoCategorise,
+                    child: const Text('Auto-categorise'),
+                  ),
+                ),
+              if (_uncategorisedCount > 0 && _pendingCount > 0)
+                const SizedBox(width: 12),
+              if (_pendingCount > 0)
+                Expanded(
+                  child: ElevatedButton(
+                    style: WoButtons.primary,
+                    onPressed: _busy ? null : _clearAllPending,
+                    child: const Text('Clear all'),
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _autoCategorise() async {
+    setState(() => _busy = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final n = await _repo!.autoCategoriseUncategorised();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    messenger.showSnackBar(SnackBar(
+      content: Text(n > 0
+          ? 'Categorised $n transaction(s)'
+          : 'Nothing could be categorised confidently'),
+    ));
+    await _load();
+  }
+
+  Future<void> _clearAllPending() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: WoColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(WoRadius.card)),
+        title: Text('Clear all pending?', style: WoText.title()),
+        content: Text(
+          'Marks all $_pendingCount imported transaction(s) as cleared. They '
+          'stay in your ledger and keep counting toward every total — this '
+          'only means you are no longer asked to review them one by one.',
+          style: WoText.body(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.inter(color: WoColors.textMid)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Clear all',
+                style: GoogleFonts.inter(color: WoColors.gold, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final n = await _repo!.clearAllPending();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    messenger.showSnackBar(SnackBar(content: Text('Cleared $n transaction(s)')));
+    await _load();
+  }
 
   Widget _buildAnchorTile(_AnchorVm vm) {
     final explained = vm.drift.abs() < 1;

@@ -4,6 +4,8 @@ import '../database/database.dart';
 import '../services/secure_vault.dart';
 import '../../core/utils/currency_utils.dart';
 import '../../core/amount_sanity.dart';
+import '../../core/merchant_rules.dart';
+import '../services/statement_processor.dart' show isBrokerageSender;
 
 /// Status marking the counter-leg of a matched transfer.
 ///
@@ -1418,6 +1420,165 @@ class AppRepository {
   Future<void> deleteStatementQueueItem(String id) =>
     (_db.delete(_db.statementQueue)..where((t) => t.id.equals(id))).go();
     
+  /// Give every unmapped source the account its statements belong in,
+  /// creating that account when it does not exist yet.
+  ///
+  /// Unmapping a misrouted source stops it corrupting another bank's ledger,
+  /// but leaves it unable to import at all. This closes the loop: the bank
+  /// name determines the account, its currency (an HDFC statement is ₹, an
+  /// Emirates NBD one is AED) and whether it is a card or a bank account.
+  /// Returns how many sources were mapped.
+  Future<int> autoMapUnmappedSources() async {
+    final sources = await getAllStatementSources();
+    int n = 0;
+    for (final s in sources) {
+      if (s.accountId != null && await getAccount(s.accountId!) != null) continue;
+      final bank = s.bankName.trim();
+      if (bank.isEmpty ||
+          bank.toLowerCase() == 'unknown bank' ||
+          bank.toLowerCase() == 'unknown source') {
+        continue; // cannot tell which account this belongs to; leave for the user
+      }
+
+      final hint = '$bank ${s.senderEmail} ${s.accountType}';
+      final isCard = CurrencyUtils.isCreditCardHint(hint);
+      final isBroker = isBrokerageSender(hint);
+      final currency = CurrencyUtils.currencyForBank(hint);
+      final type = isBroker ? 'brokerage' : (isCard ? 'credit_card' : 'bank');
+      final name = isCard ? '$bank Card' : bank;
+
+      final accounts = await getAllAccounts();
+      var account = accounts
+          .where((a) =>
+              a.name.trim().toLowerCase() == name.toLowerCase() && a.type == type)
+          .firstOrNull;
+
+      if (account == null) {
+        final id = 'acct_auto_${name.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '_')}_$type';
+        await insertAccount(AccountsCompanion.insert(
+          id: id,
+          name: name,
+          type: type,
+          currencyCode: currency,
+          institution: Value(bank),
+        ));
+        account = await getAccount(id);
+        debugPrint('🏦 Created $name ($type, $currency) for ${s.senderEmail}');
+      }
+      if (account == null) continue;
+
+      await updateStatementSource(
+          s.id, StatementSourcesCompanion(accountId: Value(account.id)));
+      n++;
+    }
+    return n;
+  }
+
+  /// Fill in categories the import left blank, using merchant rules and
+  /// anything the user has already taught the app.
+  ///
+  /// A quarter of an imported ledger arrives uncategorised, and nothing that
+  /// reads categories — budgets, the 50/30/20 split, the coach — can see
+  /// those rows. Only confident matches are applied; the rest stay blank
+  /// rather than being filed somewhere plausible but wrong.
+  Future<int> autoCategoriseUncategorised({int limit = 5000}) async {
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.categoryId.isNull() & t.type.isIn(['income', 'expense']))
+          ..limit(limit))
+        .get();
+    int n = 0;
+    for (final t in rows) {
+      // What the user taught us always beats a keyword rule.
+      final learned = await getLearnedCategory(t.merchant);
+      final categoryId = learned ??
+          MerchantRules.categorise(t.description, t.merchant, t.type);
+      if (categoryId == null) continue;
+      await (_db.update(_db.transactions)..where((x) => x.id.equals(t.id)))
+          .write(TransactionsCompanion(categoryId: Value(categoryId)));
+      n++;
+    }
+    if (n > 0) debugPrint('🏷️ Categorised $n previously uncategorised rows');
+    return n;
+  }
+
+  /// Mark every pending imported transaction on an account as cleared.
+  ///
+  /// Imports land as `pending` so they can be reviewed, but a first sync
+  /// produces well over a thousand of them and reviewing that one at a time
+  /// is not a real workflow. Returns how many were cleared.
+  Future<int> clearAllPending({String? accountId}) async {
+    final q = _db.update(_db.transactions)
+      ..where((t) => accountId == null
+          ? t.status.equals('pending')
+          : t.status.equals('pending') & t.accountId.equals(accountId));
+    return q.write(const TransactionsCompanion(status: Value('cleared')));
+  }
+
+  Future<int> countPendingTransactions() async {
+    final rows = await (_db.select(_db.transactions)
+          ..where((t) => t.status.equals('pending')))
+        .get();
+    return rows.length;
+  }
+
+  /// Take a brokerage account's ledger rows out of the totals.
+  ///
+  /// Before broker senders were recognised, NPS and demat statements were
+  /// parsed as bank transactions: CAMS NPS ended up as an AED 179,362 "bank
+  /// balance" built from valuation lines that were never transactions. The
+  /// rows are quarantined rather than deleted, and the statements re-queued
+  /// so they re-import through the holdings path as investments.
+  Future<int> resetBrokerageLedgers() async {
+    final accounts = await getAllAccounts();
+    int n = 0;
+    for (final a in accounts) {
+      if (a.type != 'brokerage') continue;
+
+      // NPS and Indian demat accounts are rupee-denominated; a statement
+      // parsed before the account was recognised may have inherited AED.
+      final correct = CurrencyUtils.currencyForBank('${a.name} ${a.institution ?? ''}');
+      if (correct != a.currencyCode) {
+        await (_db.update(_db.accounts)..where((x) => x.id.equals(a.id)))
+            .write(AccountsCompanion(currencyCode: Value(correct)));
+      }
+
+      final rows = await (_db.select(_db.transactions)
+            ..where((t) => t.accountId.equals(a.id) &
+                t.status.isIn(kHiddenStatuses).not() &
+                t.type.isIn(['income', 'expense'])))
+          .get();
+      for (final t in rows) {
+        await (_db.update(_db.transactions)..where((x) => x.id.equals(t.id)))
+            .write(const TransactionsCompanion(status: Value(kQuarantinedStatus)));
+        n++;
+      }
+
+      await (_db.update(_db.accounts)..where((x) => x.id.equals(a.id)))
+          .write(const AccountsCompanion(openingBalance: Value(0)));
+      await recomputeAccountBalance(a.id);
+
+      // Re-run their statements through the holdings path.
+      final sources = (await getAllStatementSources())
+          .where((x) => x.accountId == a.id)
+          .map((x) => x.id)
+          .toSet();
+      if (sources.isNotEmpty) {
+        final queued = await (_db.select(_db.statementQueue)
+              ..where((q) => q.status.isIn(['completed', 'empty'])))
+            .get();
+        for (final q in queued) {
+          if (!sources.contains(q.sourceId)) continue;
+          await updateStatementQueueStatus(q.id, 'pending', errorMessage: null);
+        }
+      }
+      if (rows.isNotEmpty) {
+        debugPrint('📈 ${a.name}: quarantined ${rows.length} ledger row(s), '
+            're-queued its statements as holdings');
+      }
+    }
+    return n;
+  }
+
   /// Unmap statement sources that point at an account belonging to a
   /// different bank.
   ///

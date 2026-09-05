@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
 import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
 import '../../core/amount_sanity.dart';
@@ -290,6 +292,22 @@ class StatementProcessor {
     );
   }
 
+  /// Write the first few thousand characters of a brokerage statement to
+  /// the app's external files directory for inspection over ADB.
+  static Future<void> _sampleBrokerageText(String label, String text) async {
+    try {
+      final dir = await getExternalStorageDirectory();
+      if (dir == null) return;
+      final safe = label.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '_');
+      final file = File('${dir.path}/brokerage_sample_$safe.txt');
+      await file.writeAsString(
+          text.length > 6000 ? text.substring(0, 6000) : text);
+      debugPrint('📄 Brokerage sample written: ${file.path}');
+    } catch (e) {
+      debugPrint('Brokerage sample skipped: $e');
+    }
+  }
+
   /// Map whatever the model answered onto `income` or `expense`.
   static String _normalizeType(Object? raw) {
     final t = (raw ?? 'expense').toString().trim().toLowerCase();
@@ -342,6 +360,14 @@ class StatementProcessor {
 
     final account = await repository.getAccount(accountId);
     final currency = account?.currencyCode ?? 'INR';
+
+    // Evidence before guesswork. Twenty-two Zerodha statements have been
+    // processed successfully and produced zero holdings, which means the
+    // holdings prompt is being shown something it does not recognise — a
+    // P&L or a ledger rather than a positions list. Keep a sample of the
+    // extracted text so the prompt can be fixed against the real document
+    // instead of a guess. Overwritten each run; app-private storage.
+    await _sampleBrokerageText(bankName ?? accountId, text);
 
     final holdings = await GeminiService.parseBrokerageStatement(text);
     final asOf = GeminiService.lastStatementDate;

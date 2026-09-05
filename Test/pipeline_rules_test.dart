@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:wealth_orbit/core/amount_sanity.dart';
 import 'package:wealth_orbit/core/statement_date.dart';
+import 'package:wealth_orbit/core/merchant_rules.dart';
 import 'package:wealth_orbit/core/utils/currency_utils.dart';
 import 'package:wealth_orbit/data/repositories/app_repository.dart';
 import 'package:wealth_orbit/data/services/statement_processor.dart';
@@ -280,6 +281,51 @@ void main() {
       // '98' expands to 1998, which the plausibility window then rejects —
       // a 1998 line in a statement is a misread, not history.
       expect(StatementDate.parse('14-08-98', now: now), isNull);
+    });
+  });
+
+  group('MerchantRules.categorise', () {
+    String? cat(String desc, {String type = 'expense'}) =>
+        MerchantRules.categorise(desc, null, type);
+
+    test('recognises everyday UAE and Indian merchants', () {
+      expect(cat('POS CARREFOUR MALL OF EMIRATES'), 'cat_groceries');
+      expect(cat('UPI/SWIGGY/1234'), 'cat_dining');
+      expect(cat('CAREEM RIDE DUBAI'), 'cat_transport');
+      expect(cat('SALIK TOLL'), 'cat_transport');
+      expect(cat('NETFLIX SUBSCRIPTION'), 'cat_subscriptions');
+      expect(cat('DEWA BILL PAYMENT'), 'cat_utilities');
+      expect(cat('XDX TANISHQ MANKHOOL'), 'cat_shopping');
+      expect(cat('AGODA COMPANY PTE LTD'), 'cat_travel');
+    });
+
+    test('never files an income line as spending', () {
+      // A salary credit must not become "shopping" because of a stray word.
+      expect(cat('SALARY CREDIT AUG', type: 'income'), 'cat_salary');
+      expect(cat('AMAZON REFUND', type: 'income'), 'cat_refund');
+      // ...and an expense must never land in an income category.
+      expect(cat('SALARY ADVANCE RECOVERY'), isNot('cat_salary'));
+    });
+
+    test('never files spending as income', () {
+      expect(cat('CARREFOUR', type: 'income'), isNull);
+    });
+
+    test('leaves ambiguous narrations alone rather than guessing', () {
+      for (final d in [
+        'TRANSFER 8829201',
+        'POS 449102',
+        'MISC DEBIT',
+        '',
+        'NEFT DR-XXXXXX',
+      ]) {
+        expect(cat(d), isNull, reason: d);
+      }
+    });
+
+    test('does not confuse Emirates the airline with Emirates NBD the bank', () {
+      expect(cat('EMIRATES NBD ATM'), isNot('cat_travel'));
+      expect(cat('EMIRATES AIRLINE TICKET'), 'cat_travel');
     });
   });
 }
