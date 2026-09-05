@@ -306,8 +306,21 @@ class AppRepository {
         & t.status.isIn(kLedgerHiddenStatuses).not())
       ..orderBy([(t) => OrderingTerm.desc(t.transactionDate)])).get();
   
-  Future<int> insertTransaction(TransactionsCompanion transaction) async {
-    final rowId = await _db.into(_db.transactions).insert(transaction);
+  /// Insert a transaction.
+  ///
+  /// [replaceExisting] is for statement imports, whose ids are derived from
+  /// the line's own content: a colliding id means the same line, so writing
+  /// over it is correct. Without it, re-reading a statement collided with
+  /// the quarantined rows it was replacing — the duplicate gate rightly
+  /// ignores set-aside rows, but the primary key does not, so the insert
+  /// threw UNIQUE constraint failed and took the whole statement with it.
+  Future<int> insertTransaction(
+    TransactionsCompanion transaction, {
+    bool replaceExisting = false,
+  }) async {
+    final rowId = replaceExisting
+        ? await _db.into(_db.transactions).insertOnConflictUpdate(transaction)
+        : await _db.into(_db.transactions).insert(transaction);
     await _recomputeForCompanion(transaction);
     return rowId;
   }
@@ -1534,6 +1547,23 @@ class AppRepository {
     return n;
   }
 
+  /// Re-queue statements whose recorded error contains [needle], for when a
+  /// failure turns out to have been the app's fault rather than the
+  /// statement's.
+  Future<int> requeueFailuresMatching(String needle) async {
+    final rows = await (_db.select(_db.statementQueue)
+          ..where((q) => q.status.isIn(['failed', 'empty'])))
+        .get();
+    final n = needle.toLowerCase();
+    int count = 0;
+    for (final row in rows) {
+      if (!(row.errorMessage ?? '').toLowerCase().contains(n)) continue;
+      await updateStatementQueueStatus(row.id, 'pending', errorMessage: null);
+      count++;
+    }
+    return count;
+  }
+
   /// Re-open statements that closed themselves as "already imported" while
   /// the duplicate gate was matching against rows that had been set aside.
   Future<int> requeueFalselyEmptyStatements() async {
@@ -1575,6 +1605,62 @@ class AppRepository {
       await recomputeAccountBalance(id);
     }
     return rows.length;
+  }
+
+  /// The account a statement belongs in, given what the document actually
+  /// is rather than who sent it.
+  ///
+  /// Banks send card and account statements from lookalike addresses, so
+  /// routing on the sender put Wio's card statement into the Wio bank
+  /// account — where a repayment, printed as a positive number, read as
+  /// income. When the document disagrees with the account it was aimed at,
+  /// the statement is moved to the right sibling, creating it if needed,
+  /// and a plainly mis-typed account is renamed to what it is.
+  Future<String> resolveAccountForStatementKind({
+    required String accountId,
+    required bool isCardStatement,
+  }) async {
+    final current = await getAccount(accountId);
+    if (current == null) return accountId;
+    final isCardAccount = current.type == 'credit_card';
+    if (isCardAccount == isCardStatement) return accountId;
+
+    // "Wio Card" and "Wio" are the same institution.
+    final base = current.name.replaceAll(RegExp(r'\s+card$', caseSensitive: false), '').trim();
+    final wantedName = isCardStatement ? '$base Card' : base;
+    final wantedType = isCardStatement ? 'credit_card' : 'bank';
+
+    final accounts = await getAllAccounts();
+    var target = accounts
+        .where((a) =>
+            a.type == wantedType &&
+            a.name.trim().toLowerCase() == wantedName.toLowerCase())
+        .firstOrNull;
+
+    if (target == null) {
+      // A card account holding the plain institution name is simply
+      // mislabelled; rename it so the bank account can take that name.
+      if (!isCardStatement &&
+          current.name.trim().toLowerCase() == base.toLowerCase()) {
+        await (_db.update(_db.accounts)..where((a) => a.id.equals(current.id)))
+            .write(AccountsCompanion(name: Value('$base Card')));
+        debugPrint('🏷️ Renamed ${current.name} → $base Card (it is a card)');
+      }
+      final id = 'acct_${wantedType}_${base.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '_')}';
+      if (await getAccount(id) == null) {
+        await insertAccount(AccountsCompanion.insert(
+          id: id,
+          name: wantedName,
+          type: wantedType,
+          currencyCode: current.currencyCode,
+          institution: Value(base),
+        ));
+        debugPrint('🏦 Created $wantedName ($wantedType) for a '
+            '${isCardStatement ? "card" : "bank"} statement');
+      }
+      target = await getAccount(id);
+    }
+    return target?.id ?? accountId;
   }
 
   /// Give every unmapped source the account its statements belong in,

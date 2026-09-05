@@ -246,6 +246,34 @@ void main() async {
       debugPrint('requeue_false_empty_v452 skipped: $e');
     }
 
+    // Statements that died on "UNIQUE constraint failed: transactions.id"
+    // hit a bug, not a problem with the statement. Re-open them.
+    try {
+      if (!await repo.getBoolSetting('requeue_pk_failures_v461')) {
+        final n = await repo.requeueFailuresMatching('unique constraint');
+        await repo.setAppSetting('requeue_pk_failures_v461', 'true');
+        if (n > 0) debugPrint('♻️ Re-opened $n statement(s) lost to a key collision');
+      }
+    } catch (e) {
+      debugPrint('requeue_pk_failures_v461 skipped: $e');
+    }
+
+    // One-shot (v4.7.0): statements were routed by sender, so card and
+    // account statements from the same bank shared one account — which is
+    // why Wio card repayments read as income. Routing now follows the
+    // document, so everything must be read again to land correctly.
+    try {
+      if (!await repo.getBoolSetting('route_by_kind_v470')) {
+        final superseded = await repo.quarantineAllStatementTransactions();
+        final requeued = await repo.requeueCompletedStatements();
+        await repo.setAppSetting('route_by_kind_v470', 'true');
+        debugPrint('🔀 Re-route rebuild: $superseded row(s) set aside, '
+            '$requeued statement(s) re-queued');
+      }
+    } catch (e) {
+      debugPrint('route_by_kind_v470 skipped: $e');
+    }
+
     // One-shot: remove AI-misparsed mega-amounts (e.g. Travclan ₹billions)
     // and reset affected account closing anchors so balances can recover.
     try {

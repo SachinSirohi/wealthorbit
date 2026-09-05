@@ -5,6 +5,7 @@ import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
 import '../../core/amount_sanity.dart';
 import '../../core/statement_date.dart';
+import '../../core/statement_kind.dart';
 import '../database/database.dart';
 import '../repositories/app_repository.dart';
 import 'gemini_service.dart';
@@ -116,6 +117,8 @@ class StatementProcessor {
     String? senderEmail,
     DateTime? statementDate,
   }) async {
+    // ignore: parameter_assignments — re-pointed below once the document
+    // tells us which account it actually belongs to.
     final text = await _extractText(
       bytes: bytes,
       password: pdfPassword,
@@ -132,6 +135,23 @@ class StatementProcessor {
     // The account's own currency is the authoritative reporting currency
     // (an HDFC statement is ₹ even if the AI guesses otherwise). amountBase
     // is the value converted into the user's base currency for aggregates.
+    // What the document IS decides where it goes. A card statement aimed at
+    // a bank account turns every repayment into income; a bank statement
+    // aimed at a card account gets its balance stored as debt.
+    final kind = StatementKindDetector.detect(text);
+    var targetAccountId = accountId;
+    if (kind != null) {
+      targetAccountId = await repository.resolveAccountForStatementKind(
+        accountId: accountId,
+        isCardStatement: kind == StatementKind.creditCard,
+      );
+      if (targetAccountId != accountId) {
+        debugPrint('🔀 ${kind == StatementKind.creditCard ? "Card" : "Bank"} '
+            'statement re-routed to its matching account');
+      }
+    }
+    accountId = targetAccountId;
+
     final account = await repository.getAccount(accountId);
     final currency = account?.currencyCode ?? 'AED';
     final isCardAccount = account?.type == 'credit_card';
@@ -286,7 +306,7 @@ class StatementProcessor {
         sourceStatementId: Value(statementId),
         txnClass: Value(txnClass.isEmpty ? null : txnClass),
         status: const Value('pending'),
-      ));
+      ), replaceExisting: true);
       count++;
     }
     if (skippedDupes > 0) {

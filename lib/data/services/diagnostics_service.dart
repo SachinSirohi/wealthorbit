@@ -103,6 +103,29 @@ class DiagnosticsService {
       }
     }
 
+    // Raw failure text, deduplicated. The bucketed counts say how many, not
+    // what — and "other" is exactly the bucket that needs reading.
+    final failureSamples = <String, int>{};
+    for (final q in queue) {
+      if (q.status != 'failed' && q.status != 'empty') continue;
+      final msg = (q.errorMessage ?? '(none)');
+      final key = msg.length > 160 ? '${msg.substring(0, 160)}…' : msg;
+      failureSamples[key] = (failureSamples[key] ?? 0) + 1;
+    }
+    final topFailures = failureSamples.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    // Recent income, so "is my salary here?" is answerable directly.
+    final since = now.subtract(const Duration(days: 75));
+    final incomeRows = all
+        .where((t) =>
+            t.type == 'income' &&
+            !kHiddenStatuses.contains(t.status) &&
+            t.transactionDate.isAfter(since))
+        .toList()
+      ..sort((a, b) => b.amountBase.compareTo(a.amountBase));
+    final accountNames = {for (final a in accounts) a.id: a.name};
+
     // ── Sources ─────────────────────────────────────────────────────────
     final sources = await repo.getAllStatementSources();
     final sourceRows = <Map<String, dynamic>>[];
@@ -166,7 +189,23 @@ class DiagnosticsService {
         'total': queue.length,
         'by_status': queueByStatus,
         'failure_reasons': failureReasons,
+        'failure_samples': {
+          for (final e in topFailures.take(14)) e.key: e.value,
+        },
       },
+      'recent_income': [
+        for (final t in incomeRows.take(20))
+          {
+            'date': t.transactionDate.toIso8601String().split('T').first,
+            'account': accountNames[t.accountId],
+            'description':
+                t.description.length > 48 ? t.description.substring(0, 48) : t.description,
+            'amount': _r(t.amountSource),
+            'currency': t.currencyCode,
+            'category': t.categoryId,
+            'class': t.txnClass,
+          },
+      ],
       'sources': sourceRows,
       'investments': {
         'assets': assets.length,

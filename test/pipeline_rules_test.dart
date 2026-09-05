@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:wealth_orbit/core/amount_sanity.dart';
 import 'package:wealth_orbit/core/statement_date.dart';
+import 'package:wealth_orbit/core/statement_kind.dart';
 import 'package:wealth_orbit/core/merchant_rules.dart';
 import 'package:wealth_orbit/data/services/llm_router.dart';
 import 'package:wealth_orbit/data/services/secure_vault.dart';
@@ -513,6 +514,68 @@ void main() {
             tx(type: 'expense', description: 'SALARY ADVANCE RECOVERY')),
         isFalse,
       );
+    });
+  });
+
+  group('StatementKindDetector', () {
+    // Shaped after the real documents: a card statement quotes a limit, a
+    // minimum payment and a due date; a current-account statement does not.
+    const cardStatement = r"""
+Transactions
+Date Ref. Number Description Card Number Amount
+07/05/2026 P571289867 Garden fresh ****0606 -30.00
+28/05/2026 P099256878 Credit Repayment +4,561.23
+Account summary
+Purchases +13,832.74
+Payments and credits -8,730.41
+Closing balance (Total to pay) 5,104.65
+MIN. PAYMENT DUE 454.77
+PAYMENT DUE DATE 07/06/2026
+AVAILABLE CREDIT LIMIT 4,259.06
+CREDIT LIMIT 10,000.00
+CREDIT STATEMENT
+""";
+
+    const bankStatement = r"""
+Statement of Account - Savings Account
+Account Number 1234567890
+Value Date  Description  Withdrawal  Deposit  Balance
+01-08-2026  SALARY CREDIT AUGUST          18,000.00   23,104.65
+03-08-2026  POS CARREFOUR      245.50                 22,859.15
+Opening balance 5,104.65
+Available balance 22,859.15
+""";
+
+    test('recognises a card statement', () {
+      expect(StatementKindDetector.detect(cardStatement),
+          StatementKind.creditCard);
+    });
+
+    test('recognises a current-account statement', () {
+      expect(StatementKindDetector.detect(bankStatement), StatementKind.bank);
+    });
+
+    test('an IBAN quoted for payment does not turn a card statement into a bank one', () {
+      const withIban = '$cardStatement\nPay to IBAN AE12 3456 7890 1234';
+      expect(StatementKindDetector.detect(withIban), StatementKind.creditCard);
+    });
+
+    test('says nothing when the document says nothing', () {
+      // Better to leave an import where it is than move it on a guess.
+      expect(StatementKindDetector.detect('x' * 400), isNull);
+      expect(StatementKindDetector.detect('too short'), isNull);
+    });
+
+    test('one stray phrase is not enough to call it a card statement', () {
+      const almost = r"""
+Statement for the period shown below. Please quote your card number when
+calling our service desk. This document is issued for your records only.
+Date Description Amount
+01-08-2026 Some payment 100.00
+02-08-2026 Another entry 250.00
+""";
+      expect(
+          StatementKindDetector.detect(almost), isNot(StatementKind.creditCard));
     });
   });
 }
